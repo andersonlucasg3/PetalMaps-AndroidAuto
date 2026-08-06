@@ -15,9 +15,9 @@ val androidAutoManifestPatch = resourcePatch(
     description = "Adds the Android Auto CarAppService declaration, meta-data, " +
             "and permissions to AndroidManifest.xml.",
 ) {
-    // Version left open to support future updates; tested on 4.7.0.322
+    // Target: com.huawei.maps.app 4.7.0.322(001) — versionCode 40700322
     @Suppress("DEPRECATION")
-    compatibleWith("com.huawei.maps.app")
+    compatibleWith("com.huawei.maps.app" to setOf("4.7.0.322(001)"))
 
     execute {
         document("AndroidManifest.xml").use { doc ->

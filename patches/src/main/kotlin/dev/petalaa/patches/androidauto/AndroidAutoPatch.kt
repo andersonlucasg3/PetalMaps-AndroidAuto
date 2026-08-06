@@ -27,7 +27,7 @@ val androidAutoPatch = bytecodePatch(
             "full functionality on non-Huawei devices.",
 ) {
     @Suppress("DEPRECATION")
-    compatibleWith("com.huawei.maps.app")
+    compatibleWith("com.huawei.maps.app" to setOf("4.7.0.322(001)"))
 
     dependsOn(
         androidAutoManifestPatch,

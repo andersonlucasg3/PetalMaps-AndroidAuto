@@ -26,7 +26,7 @@ val manufacturerCheckBypassPatch = bytecodePatch(
             "allowing non-Huawei devices to use the app.",
 ) {
     @Suppress("DEPRECATION")
-    compatibleWith("com.huawei.maps.app")
+    compatibleWith("com.huawei.maps.app" to setOf("4.7.0.322(001)"))
 
     execute {
         ManufacturerCheckFingerprint.method.returnEarly(true)

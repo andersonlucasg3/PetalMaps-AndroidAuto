@@ -21,7 +21,7 @@ val antiRepackPatch = bytecodePatch(
             "that kills the process upon detecting APK re-signing.",
 ) {
     @Suppress("DEPRECATION")
-    compatibleWith("com.huawei.maps.app")
+    compatibleWith("com.huawei.maps.app" to setOf("4.7.0.322(001)"))
 
     execute {
         SecurityDetectIrpjFingerprint.method.returnEarly(false)

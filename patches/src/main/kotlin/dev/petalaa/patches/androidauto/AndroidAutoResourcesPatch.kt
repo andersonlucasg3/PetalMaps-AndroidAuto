@@ -14,7 +14,7 @@ val androidAutoResourcesPatch = resourcePatch(
     description = "Adds the automotive_app_desc.xml resource required by Android Auto.",
 ) {
     @Suppress("DEPRECATION")
-    compatibleWith("com.huawei.maps.app")
+    compatibleWith("com.huawei.maps.app" to setOf("4.7.0.322(001)"))
 
     finalize {
         val descPath = "res/xml/automotive_app_desc.xml"
