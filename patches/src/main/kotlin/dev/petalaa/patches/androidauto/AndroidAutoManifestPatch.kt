@@ -26,7 +26,7 @@ val androidAutoManifestPatch = resourcePatch(
 
             // --- Meta-data ---
 
-            fun addMetaDataIfMissing(name: String, value: String) {
+            fun addMetaDataIfMissing(name: String, value: String, attribute: String = "android:value") {
                 val existing = applicationNode.getElementsByTagName("meta-data")
                 for (i in 0 until existing.length) {
                     val node = existing.item(i) as? Element ?: continue
@@ -34,13 +34,16 @@ val androidAutoManifestPatch = resourcePatch(
                 }
                 val meta = doc.createElement("meta-data")
                 meta.setAttribute("android:name", name)
-                meta.setAttribute("android:value", value)
+                meta.setAttribute(attribute, value)
                 applicationNode.appendChild(meta)
             }
 
+            // android:resource (0x01010025), not android:value: the meta-data must be
+            // a resource reference resolving into resources.arsc, as in Google Maps.
             addMetaDataIfMissing(
                 "com.google.android.gms.car.application",
-                "@xml/automotive_app_desc"
+                "@xml/automotive_app_desc",
+                attribute = "android:resource",
             )
             addMetaDataIfMissing(
                 "androidx.car.app.minCarApiLevel",

@@ -43,6 +43,10 @@ object AASelfTweaker {
     private const val FLAG_APP_WHITE_LIST = "app_white_list"
     private const val FLAG_BROADCAST_WHITELIST = "car_connect_broadcast_whitelist"
 
+    // flag_overrides.type values (new phenotype schema).
+    private const val TYPE_BOOL = 1
+    private const val TYPE_STRING = 4
+
     private val executor = Executors.newSingleThreadExecutor { runnable ->
         Thread(runnable, "PetalAA-Tweaker").apply { isDaemon = true }
     }
@@ -106,18 +110,33 @@ object AASelfTweaker {
                 workDb.absolutePath, null, SQLiteDatabase.OPEN_READWRITE
             )
             try {
-                if (!tableExists(db, "FlagOverrides")) {
-                    Log.w(TAG, "FlagOverrides table not found — unsupported GMS schema, skipping")
-                    return
+                val hasNewSchema = tableExists(db, "flag_overrides")
+                val hasLegacySchema = tableExists(db, "FlagOverrides")
+                when {
+                    hasNewSchema -> {
+                        Log.i(TAG, "New phenotype schema detected (flag_overrides)")
+                        if (isPackageWhitelistedNewSchema(db, ourPackage)) {
+                            Log.i(TAG, "'$ourPackage' already in $FLAG_APP_WHITE_LIST — nothing to do")
+                            return
+                        }
+                        Log.i(TAG, "'$ourPackage' missing from allowlist — registering (new schema)")
+                        applyNewSchemaOverrides(db, ourPackage)
+                    }
+                    hasLegacySchema -> {
+                        Log.i(TAG, "Legacy phenotype schema detected (FlagOverrides)")
+                        if (isPackageWhitelisted(db, ourPackage)) {
+                            Log.i(TAG, "'$ourPackage' already in $FLAG_APP_WHITE_LIST — nothing to do")
+                            return
+                        }
+                        Log.i(TAG, "'$ourPackage' missing from allowlist — registering (legacy schema)")
+                        applyFlagOverrides(db, ourPackage)
+                    }
+                    else -> {
+                        Log.w(TAG, "No known overrides table (flag_overrides / FlagOverrides) " +
+                                "— unsupported GMS schema, skipping")
+                        return
+                    }
                 }
-
-                if (isPackageWhitelisted(db, ourPackage)) {
-                    Log.i(TAG, "'$ourPackage' already in $FLAG_APP_WHITE_LIST — nothing to do")
-                    return
-                }
-
-                Log.i(TAG, "'$ourPackage' missing from allowlist — registering")
-                applyFlagOverrides(db, ourPackage)
 
                 // 6. Checkpoint the WAL so all changes live in the main db file
                 //    before we copy it back over the original.
@@ -133,6 +152,14 @@ object AASelfTweaker {
             if (cpExit != 0) {
                 Log.e(TAG, "Failed to copy patched db back: $cpErr")
                 return
+            }
+            Log.i(TAG, "Patched db copied back to $PHENOTYPE_DB_PATH")
+
+            // 7b. Drop stale WAL/SHM at the destination so GMS cannot replay an
+            //     old journal over the patched db.
+            val (rmExit, _, rmErr) = runSu("rm -f $PHENOTYPE_DB_PATH-wal $PHENOTYPE_DB_PATH-shm")
+            if (rmExit != 0) {
+                Log.w(TAG, "rm of stale -wal/-shm failed (exit=$rmExit): $rmErr")
             }
 
             // 8. Restore ownership and SELinux context so GMS can open the db.
@@ -185,6 +212,7 @@ object AASelfTweaker {
     /** True when [pkg] already appears in the `app_white_list` override. */
     private fun isPackageWhitelisted(db: SQLiteDatabase, pkg: String): Boolean {
         val current = readOverrideValue(db, GMS_CAR_PACKAGE, FLAG_APP_WHITE_LIST) ?: return false
+        Log.i(TAG, "Current $FLAG_APP_WHITE_LIST value: '$current'")
         return current.split(',').any { it.trim() == pkg }
     }
 
@@ -199,6 +227,134 @@ object AASelfTweaker {
         }.getOrElse {
             Log.w(TAG, "Could not read override '$name'", it)
             null
+        }
+    }
+
+    // ---- New schema (flag_overrides, GMS >= 26.x) --------------------------
+
+    /**
+     * Resolves the numeric `config_package_id` for a config package name.
+     * IDs are device-specific (e.g. 230 for gms.car on the test device), so
+     * they must be looked up at runtime. An exact name match is preferred
+     * over a prefix (LIKE 'prefix%') match when several rows qualify.
+     */
+    private fun resolveConfigPackageId(db: SQLiteDatabase, packagePrefix: String): Long? {
+        return runCatching {
+            db.rawQuery(
+                "SELECT config_package_id, name FROM config_packages WHERE name LIKE ?",
+                arrayOf("$packagePrefix%")
+            ).use { cursor ->
+                var firstId: Long? = null
+                while (cursor.moveToNext()) {
+                    val id = cursor.getLong(0)
+                    val name = cursor.getString(1)
+                    if (firstId == null) firstId = id
+                    if (name == packagePrefix) {
+                        Log.i(TAG, "Resolved config_package_id=$id for exact match '$name'")
+                        return@use id
+                    }
+                }
+                firstId?.also {
+                    Log.i(TAG, "Resolved config_package_id=$it for prefix '$packagePrefix%'")
+                }
+            }
+        }.getOrElse {
+            Log.w(TAG, "Failed to resolve config_package_id for '$packagePrefix'", it)
+            null
+        }
+    }
+
+    /** Reads a `flag_overrides.value` for the given config package (new schema). */
+    private fun readNewOverrideValue(
+        db: SQLiteDatabase, configPackageId: Long, name: String
+    ): String? {
+        return runCatching {
+            db.rawQuery(
+                "SELECT value FROM flag_overrides " +
+                    "WHERE config_package_id=? AND account_id=0 AND active=1 AND name=?",
+                arrayOf(configPackageId.toString(), name)
+            ).use { cursor ->
+                if (cursor.moveToFirst() && !cursor.isNull(0)) cursor.getString(0) else null
+            }
+        }.getOrElse {
+            Log.w(TAG, "Could not read new-schema override '$name'", it)
+            null
+        }
+    }
+
+    /** True when [pkg] already appears in `app_white_list` (new schema). */
+    private fun isPackageWhitelistedNewSchema(db: SQLiteDatabase, pkg: String): Boolean {
+        val gmsCarId = resolveConfigPackageId(db, GMS_CAR_PACKAGE) ?: run {
+            Log.w(TAG, "config_packages has no entry for '$GMS_CAR_PACKAGE' — cannot verify")
+            return false
+        }
+        val current = readNewOverrideValue(db, gmsCarId, FLAG_APP_WHITE_LIST) ?: return false
+        Log.i(TAG, "Current $FLAG_APP_WHITE_LIST value: '$current'")
+        return current.split(',').any { it.trim() == pkg }
+    }
+
+    /** INSERT OR REPLACE one row into flag_overrides (new schema), with logging. */
+    private fun putNewOverride(
+        db: SQLiteDatabase, configPackageId: Long, name: String, value: String, type: Int
+    ) {
+        Log.i(TAG, "INSERT flag_overrides: config_package_id=$configPackageId " +
+                "name='$name' value='$value' type=$type")
+        db.execSQL(
+            "INSERT OR REPLACE INTO flag_overrides " +
+                "(config_package_id, config_package_name, account_id, active, name, value, type, source) " +
+                "VALUES (?, NULL, 0, 1, ?, ?, ?, 0)",
+            arrayOf<Any>(configPackageId, name, value, type)
+        )
+    }
+
+    /**
+     * Applies the full override set using the new `flag_overrides` schema.
+     * String flags merge our package into the existing CSV (preserving other
+     * apps' entries); boolean flags are unconditional.
+     */
+    private fun applyNewSchemaOverrides(db: SQLiteDatabase, pkg: String) {
+        val gmsCarId = resolveConfigPackageId(db, GMS_CAR_PACKAGE)
+        val gearheadId = resolveConfigPackageId(db, GEARHEAD_PACKAGE)
+        if (gmsCarId == null && gearheadId == null) {
+            Log.w(TAG, "Could not resolve any config_package_id — nothing written")
+            return
+        }
+
+        if (gmsCarId != null) {
+            val mergedWhiteList = mergeCsv(
+                readNewOverrideValue(db, gmsCarId, FLAG_APP_WHITE_LIST), pkg
+            )
+            val mergedBroadcast = mergeCsv(
+                readNewOverrideValue(db, gmsCarId, FLAG_BROADCAST_WHITELIST), pkg
+            )
+            putNewOverride(db, gmsCarId, FLAG_APP_WHITE_LIST, mergedWhiteList, TYPE_STRING)
+            putNewOverride(db, gmsCarId, FLAG_BROADCAST_WHITELIST, mergedBroadcast, TYPE_STRING)
+            putNewOverride(db, gmsCarId, "should_bypass_validation", "1", TYPE_BOOL)
+            putNewOverride(
+                db, gmsCarId,
+                "FrameworkCarProjectionValidatorFlags__use_package_manager_api_for_installed_by_play_check",
+                "0", TYPE_BOOL
+            )
+        } else {
+            Log.w(TAG, "No config_package_id for '$GMS_CAR_PACKAGE' — gms.car flags skipped")
+        }
+
+        if (gearheadId != null) {
+            putNewOverride(db, gearheadId, "AppValidation__should_bypass_validation", "1", TYPE_BOOL)
+            putNewOverride(db, gearheadId, "AppValidation__play_install_api", "0", TYPE_BOOL)
+            putNewOverride(db, gearheadId, "AppValidation__allowed_package_list", "", TYPE_STRING)
+            putNewOverride(db, gearheadId, "AppValidation__blocked_packages_by_installer", "", TYPE_STRING)
+            putNewOverride(db, gearheadId, "UnknownSources__allow_full_screen_apps", "1", TYPE_BOOL)
+        } else {
+            Log.w(TAG, "No config_package_id for '$GEARHEAD_PACKAGE' — gearhead flags skipped")
+        }
+
+        // Best effort: the Flags table may not exist in the new schema.
+        runCatching {
+            db.execSQL("DELETE FROM Flags WHERE name='app_black_list'")
+            Log.i(TAG, "DELETE FROM Flags WHERE name='app_black_list' executed")
+        }.onFailure {
+            Log.d(TAG, "DELETE FROM Flags skipped (table absent?): ${it.message}")
         }
     }
 
@@ -219,6 +375,7 @@ object AASelfTweaker {
      */
     private fun applyFlagOverrides(db: SQLiteDatabase, pkg: String) {
         runCatching { db.execSQL("DROP TRIGGER IF EXISTS aa_patched_apps") }
+            .onFailure { Log.d(TAG, "DROP TRIGGER aa_patched_apps skipped: ${it.message}") }
 
         // Merged CSV overrides — preserve entries from other apps.
         val mergedWhiteList = mergeCsv(
@@ -228,11 +385,13 @@ object AASelfTweaker {
             readOverrideValue(db, GMS_CAR_PACKAGE, FLAG_BROADCAST_WHITELIST), pkg
         )
 
+        Log.i(TAG, "INSERT FlagOverrides: name='$FLAG_APP_WHITE_LIST' stringVal='$mergedWhiteList'")
         db.execSQL(
             "INSERT OR REPLACE INTO FlagOverrides " +
                 "(packageName,flagType,name,user,stringVal,committed) VALUES (?,0,?,?,?,0)",
             arrayOf(GMS_CAR_PACKAGE, FLAG_APP_WHITE_LIST, "", mergedWhiteList)
         )
+        Log.i(TAG, "INSERT FlagOverrides: name='$FLAG_BROADCAST_WHITELIST' stringVal='$mergedBroadcast'")
         db.execSQL(
             "INSERT OR REPLACE INTO FlagOverrides " +
                 "(packageName,flagType,name,user,stringVal,committed) VALUES (?,0,?,?,?,0)",
@@ -245,6 +404,7 @@ object AASelfTweaker {
             GEARHEAD_PACKAGE to "AppValidation__blocked_packages_by_installer"
         )
         for ((owner, name) in emptyStringRows) {
+            Log.i(TAG, "INSERT FlagOverrides: package='$owner' name='$name' stringVal=''")
             db.execSQL(
                 "INSERT OR REPLACE INTO FlagOverrides " +
                     "(packageName,flagType,name,user,stringVal,committed) VALUES (?,0,?,'','',0)",
@@ -265,6 +425,7 @@ object AASelfTweaker {
             Triple(GEARHEAD_PACKAGE, "UnknownSources__allow_full_screen_apps", 1)
         )
         for ((owner, name, value) in boolRows) {
+            Log.i(TAG, "INSERT FlagOverrides: package='$owner' name='$name' boolVal=$value")
             db.execSQL(
                 "INSERT OR REPLACE INTO FlagOverrides " +
                     "(packageName,flagType,name,user,boolVal,committed) VALUES (?,0,?,'',?,0)",
@@ -272,7 +433,12 @@ object AASelfTweaker {
             )
         }
 
-        db.execSQL("DELETE FROM Flags WHERE name='app_black_list'")
+        runCatching {
+            db.execSQL("DELETE FROM Flags WHERE name='app_black_list'")
+            Log.i(TAG, "DELETE FROM Flags WHERE name='app_black_list' executed")
+        }.onFailure {
+            Log.d(TAG, "DELETE FROM Flags skipped (table absent?): ${it.message}")
+        }
     }
 
     // ---- Shell / UI helpers -------------------------------------------------
