@@ -268,27 +268,30 @@ object AASelfTweaker {
         // 2. Stop vending so it does not rewrite the dbs while we work on them.
         runSu("am force-stop $VENDING_PACKAGE")
 
-        // 3. Discover the owner (uid:gid) of the vending data dir at runtime —
+        // 3. Discover the owner (uid:gid) of the vending dbs at runtime —
         //    it varies by device/ROM and must never be hardcoded.
-        //    Stat the db FILE (stat on the directory itself fails on some
-        //    ROMs/SELinux policies); fall back to the package's uid.
-        var (statExit, statOut, _) = runSu("stat -c '%u:%g' $LOCAL_APP_STATE_DB_PATH")
-        var owner = statOut.trim()
-        if (statExit != 0 || !owner.contains(':')) {
-            val (_, dumpOut, _) = runSu(
-                "dumpsys package $VENDING_PACKAGE | grep -m1 'userId='"
-            )
-            // e.g. "userId=10150" — use it for both uid and gid (app uid).
-            val uidMatch = Regex("userId=(\\d+)").find(dumpOut)
-            if (uidMatch != null) {
-                owner = "${uidMatch.groupValues[1]}:${uidMatch.groupValues[1]}"
-                statExit = 0
-                Log.i(TAG, "Finsky forge: owner via dumpsys fallback: $owner")
+        //    `ls -ln` is available everywhere; `stat -c` misbehaves in some
+        //    root shells when called from an app process.
+        var owner = ""
+        val (lsExit, lsOut, _) = runSu("ls -ln $LOCAL_APP_STATE_DB_PATH")
+        if (lsExit == 0) {
+            // -rw-rw---- 1 10150 10150 ... -> fields[2]=uid fields[3]=gid
+            val parts = lsOut.trim().split(Regex("\\s+"))
+            if (parts.size >= 4 && parts[2].all { it.isDigit() }) {
+                owner = "${parts[2]}:${parts[3]}"
             }
         }
-        if (statExit != 0 || !owner.contains(':')) {
+        if (owner.isEmpty()) {
+            // Fallback: "package:com.android.vending uid:10150,1010150,..."
+            val (_, pkgOut, _) = runSu("cmd package list packages -U $VENDING_PACKAGE")
+            val uidMatch = Regex("uid:(\\d+)").find(pkgOut)
+            if (uidMatch != null) {
+                owner = "${uidMatch.groupValues[1]}:${uidMatch.groupValues[1]}"
+            }
+        }
+        if (owner.isEmpty()) {
             Log.w(TAG, "Finsky forge: could not determine vending owner " +
-                    "(exit=$statExit, out='$statOut') — skipping")
+                    "(ls exit=$lsExit, out='${lsOut.trim()}') — skipping")
             return false
         }
         Log.i(TAG, "Finsky forge: vending data owner=$owner")
@@ -474,7 +477,7 @@ object AASelfTweaker {
         runSu("cp $originalPath-wal ${workDb.absolutePath}-wal")
         runSu("cp $originalPath-shm ${workDb.absolutePath}-shm")
         // Root-copied files are root-owned; make them readable by our process.
-        runSu("chmod 644 ${workDb.absolutePath} ${workDb.absolutePath}-wal ${workDb.absolutePath}-shm")
+        runSu("chmod 666 ${workDb.absolutePath} ${workDb.absolutePath}-wal ${workDb.absolutePath}-shm")
         return true
     }
 
@@ -538,7 +541,7 @@ object AASelfTweaker {
         runSu("cp $PHENOTYPE_DB_PATH-wal ${workDb.absolutePath}-wal")
         runSu("cp $PHENOTYPE_DB_PATH-shm ${workDb.absolutePath}-shm")
         // Root-copied files are root-owned; make them readable by our process.
-        runSu("chmod 644 ${workDb.absolutePath} ${workDb.absolutePath}-wal ${workDb.absolutePath}-shm")
+        runSu("chmod 666 ${workDb.absolutePath} ${workDb.absolutePath}-wal ${workDb.absolutePath}-shm")
         return true
     }
 
