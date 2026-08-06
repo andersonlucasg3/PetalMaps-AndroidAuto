@@ -1,7 +1,7 @@
 {
-    "version": "1.1.5",
-    "created_at": "2026-08-06T18:36:19",
-    "description": "AASelfTweaker now performs the Finsky forge automatically on app start (root): inserts appstate + ownership rows (with the app's own signing-certificate hash) into Play Store databases, fixing CAR.VALIDATOR 'failed all other checks' on recent GMS/AA. Self-healing on every launch.\n\n- **Android Auto**: injects PetalCarAppService and projects the built-in HiCar automotive UI (AutoPetalMapsActivity) onto the head-unit surface via VirtualDisplay, with synthetic pan/zoom/recenter gestures.\n- **Anti-Repack Bypass**: neutralises the native SecurityDetect.irpj() integrity check that kills the process on re-signed APKs.\n- **Manufacturer Check Bypass**: removes the Huawei/Honor-only device gate.\n- **Change package name**: install alongside the original app (default: morphe.huawei.petal.maps).",
-    "download_url": "https://github.com/andersonlucasg3/PetalMaps-AndroidAuto/releases/download/v1.1.5/patches-1.1.5.mpp",
+    "version": "1.1.6",
+    "created_at": "2026-08-06T19:22:48",
+    "description": "Fix AASelfTweaker on real devices: chmod work-db copies (were root-owned, unreadable by the app) and make vending owner detection robust (stat the db file with dumpsys fallback instead of stat on the data dir).\n\n- **Android Auto**: injects PetalCarAppService and projects the built-in HiCar automotive UI (AutoPetalMapsActivity) onto the head-unit surface via VirtualDisplay, with synthetic pan/zoom/recenter gestures.\n- **Anti-Repack Bypass**: neutralises the native SecurityDetect.irpj() integrity check that kills the process on re-signed APKs.\n- **Manufacturer Check Bypass**: removes the Huawei/Honor-only device gate.\n- **Change package name**: install alongside the original app (default: morphe.huawei.petal.maps).",
+    "download_url": "https://github.com/andersonlucasg3/PetalMaps-AndroidAuto/releases/download/v1.1.6/patches-1.1.6.mpp",
     "signature_download_url": ""
 }

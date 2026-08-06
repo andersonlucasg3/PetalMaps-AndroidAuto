@@ -270,10 +270,24 @@ object AASelfTweaker {
 
         // 3. Discover the owner (uid:gid) of the vending data dir at runtime —
         //    it varies by device/ROM and must never be hardcoded.
-        val (statExit, statOut, _) = runSu("stat -c '%u:%g' $VENDING_DATA_DIR")
-        val owner = statOut.trim()
+        //    Stat the db FILE (stat on the directory itself fails on some
+        //    ROMs/SELinux policies); fall back to the package's uid.
+        var (statExit, statOut, _) = runSu("stat -c '%u:%g' $LOCAL_APP_STATE_DB_PATH")
+        var owner = statOut.trim()
         if (statExit != 0 || !owner.contains(':')) {
-            Log.w(TAG, "Finsky forge: could not stat $VENDING_DATA_DIR " +
+            val (_, dumpOut, _) = runSu(
+                "dumpsys package $VENDING_PACKAGE | grep -m1 'userId='"
+            )
+            // e.g. "userId=10150" — use it for both uid and gid (app uid).
+            val uidMatch = Regex("userId=(\\d+)").find(dumpOut)
+            if (uidMatch != null) {
+                owner = "${uidMatch.groupValues[1]}:${uidMatch.groupValues[1]}"
+                statExit = 0
+                Log.i(TAG, "Finsky forge: owner via dumpsys fallback: $owner")
+            }
+        }
+        if (statExit != 0 || !owner.contains(':')) {
+            Log.w(TAG, "Finsky forge: could not determine vending owner " +
                     "(exit=$statExit, out='$statOut') — skipping")
             return false
         }
@@ -459,6 +473,8 @@ object AASelfTweaker {
         // WAL/SHM companions are optional; ignore failures.
         runSu("cp $originalPath-wal ${workDb.absolutePath}-wal")
         runSu("cp $originalPath-shm ${workDb.absolutePath}-shm")
+        // Root-copied files are root-owned; make them readable by our process.
+        runSu("chmod 644 ${workDb.absolutePath} ${workDb.absolutePath}-wal ${workDb.absolutePath}-shm")
         return true
     }
 
@@ -521,6 +537,8 @@ object AASelfTweaker {
         // WAL/SHM companions are optional; ignore failures.
         runSu("cp $PHENOTYPE_DB_PATH-wal ${workDb.absolutePath}-wal")
         runSu("cp $PHENOTYPE_DB_PATH-shm ${workDb.absolutePath}-shm")
+        // Root-copied files are root-owned; make them readable by our process.
+        runSu("chmod 644 ${workDb.absolutePath} ${workDb.absolutePath}-wal ${workDb.absolutePath}-shm")
         return true
     }
 
