@@ -32,7 +32,8 @@ BUILD_TOOLS="$ANDROID_SDK_ROOT/build-tools/36.0.0"
 
 # ── Paths ───────────────────────────────────────────────────────────────────
 MORPHE_CLI="$PROJECT_DIR/tools/morphe-cli/morphe-desktop-1.12.0-all.jar"
-PATCHES_MPP="$PROJECT_DIR/patches/build/libs/patches-1.0.0.mpp"
+PATCHES_VERSION="$(grep -E '^version' "$PROJECT_DIR/gradle.properties" | cut -d= -f2 | tr -d ' ')"
+PATCHES_MPP="$PROJECT_DIR/patches/build/libs/patches-${PATCHES_VERSION}.mpp"
 INPUT_APK="$PROJECT_DIR/tools/apk/petal-maps.apk"
 OUTPUT_UNSIGNED="$PROJECT_DIR/build/petal-maps-aa-unsigned.apk"
 OUTPUT_ALIGNED="$PROJECT_DIR/build/petal-maps-aa-aligned.apk"
@@ -60,7 +61,8 @@ ZIPALIGN="$(find_tool zipalign)"
 APKSIGNER="$(find_tool apksigner)"
 
 echo "=== Step 1/5: Build patches ==="
-./gradlew build
+# buildAndroid produces the same .mpp plus classes.dex (required by Morphe Manager on-device).
+./gradlew :patches:buildAndroid
 
 echo ""
 echo "=== Step 2/5: Apply Morphe patches ==="
