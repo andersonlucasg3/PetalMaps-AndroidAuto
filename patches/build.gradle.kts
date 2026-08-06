@@ -18,6 +18,27 @@ kotlin {
     }
 }
 
+// Separate configuration so gson is available at runtime for the
+// generatePatchesList task but never bundled into the APK.
+val patchListGeneratorClasspath: Configuration by configurations.creating
+
 dependencies {
     implementation(libs.morphe.patches.library)
+
+    patchListGeneratorClasspath(libs.gson)
+}
+
+tasks {
+    register<JavaExec>("generatePatchesList") {
+        description = "Generates patches-list.json for tooling/manager consumption"
+
+        dependsOn(build)
+
+        classpath = sourceSets["main"].runtimeClasspath + patchListGeneratorClasspath
+        mainClass.set("app.morphe.util.PatchListGeneratorKt")
+
+        // The generator writes ../patches-list.json relative to the working dir.
+        // With workingDir = projectDir (patches/), the JSON lands at repo root.
+        workingDir = projectDir
+    }
 }

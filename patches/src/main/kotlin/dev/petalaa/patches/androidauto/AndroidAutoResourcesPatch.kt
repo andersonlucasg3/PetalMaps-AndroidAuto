@@ -1,6 +1,7 @@
 package dev.petalaa.patches.androidauto
 
 import app.morphe.patcher.patch.resourcePatch
+import dev.petalaa.patches.androidauto.Constants.COMPATIBILITY_PETAL_MAPS
 
 /**
  * Resource patch that adds the required automotive app descriptor XML resource
@@ -13,8 +14,7 @@ val androidAutoResourcesPatch = resourcePatch(
     name = "Android Auto Resources",
     description = "Adds the automotive_app_desc.xml resource required by Android Auto.",
 ) {
-    @Suppress("DEPRECATION")
-    compatibleWith("com.huawei.maps.app" to setOf("4.7.0.322(001)"))
+    compatibleWith(COMPATIBILITY_PETAL_MAPS)
 
     finalize {
         val descPath = "res/xml/automotive_app_desc.xml"

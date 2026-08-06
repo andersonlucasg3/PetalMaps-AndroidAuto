@@ -7,6 +7,7 @@ agp = "9.1.0"
 annotation = "1.10.0"
 androidx-core = "1.18.0"
 car-app = "1.7.0"
+gson = "2.14.0"
 
 [libraries]
 morphe-patches-library = { module = "app.morphe:morphe-patches-library", version.ref = "morphe-patches-library" }
@@ -14,6 +15,7 @@ morphe-extensions-library = { module = "app.morphe:morphe-extensions-library", v
 annotation = { module = "androidx.annotation:annotation", version.ref = "annotation" }
 androidx-core = { module = "androidx.core:core", version.ref = "androidx-core" }
 car-app = { module = "androidx.car.app:app", version.ref = "car-app" }
+gson = { module = "com.google.code.gson:gson", version.ref = "gson" }
 
 [plugins]
 android-library = { id = "com.android.library" }

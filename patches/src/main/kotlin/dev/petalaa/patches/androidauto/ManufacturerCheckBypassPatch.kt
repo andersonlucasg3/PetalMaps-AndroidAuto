@@ -2,6 +2,7 @@ package dev.petalaa.patches.androidauto
 
 import app.morphe.patcher.patch.bytecodePatch
 import app.morphe.util.returnEarly
+import dev.petalaa.patches.androidauto.Constants.COMPATIBILITY_PETAL_MAPS
 
 /**
  * Bytecode patch that bypasses the manufacturer check in [up2.g], which
@@ -25,8 +26,7 @@ val manufacturerCheckBypassPatch = bytecodePatch(
     description = "Forces the Huawei manufacturer check to always return true, " +
             "allowing non-Huawei devices to use the app.",
 ) {
-    @Suppress("DEPRECATION")
-    compatibleWith("com.huawei.maps.app" to setOf("4.7.0.322(001)"))
+    compatibleWith(COMPATIBILITY_PETAL_MAPS)
 
     execute {
         ManufacturerCheckFingerprint.method.returnEarly(true)

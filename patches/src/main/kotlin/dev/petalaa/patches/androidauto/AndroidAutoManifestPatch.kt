@@ -1,6 +1,7 @@
 package dev.petalaa.patches.androidauto
 
 import app.morphe.patcher.patch.resourcePatch
+import dev.petalaa.patches.androidauto.Constants.COMPATIBILITY_PETAL_MAPS
 import org.w3c.dom.Element
 
 /**
@@ -15,9 +16,7 @@ val androidAutoManifestPatch = resourcePatch(
     description = "Adds the Android Auto CarAppService declaration, meta-data, " +
             "and permissions to AndroidManifest.xml.",
 ) {
-    // Target: com.huawei.maps.app 4.7.0.322(001) — versionCode 40700322
-    @Suppress("DEPRECATION")
-    compatibleWith("com.huawei.maps.app" to setOf("4.7.0.322(001)"))
+    compatibleWith(COMPATIBILITY_PETAL_MAPS)
 
     execute {
         document("AndroidManifest.xml").use { doc ->

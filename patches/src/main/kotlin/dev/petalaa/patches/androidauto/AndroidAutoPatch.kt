@@ -1,6 +1,7 @@
 package dev.petalaa.patches.androidauto
 
 import app.morphe.patcher.patch.bytecodePatch
+import dev.petalaa.patches.androidauto.Constants.COMPATIBILITY_PETAL_MAPS
 
 /**
  * Main "Android Auto" patch — the user-facing entry point that bundles all
@@ -26,8 +27,7 @@ val androidAutoPatch = bytecodePatch(
             "Also apply 'Anti-Repack Bypass' and 'Manufacturer Check Bypass' for " +
             "full functionality on non-Huawei devices.",
 ) {
-    @Suppress("DEPRECATION")
-    compatibleWith("com.huawei.maps.app" to setOf("4.7.0.322(001)"))
+    compatibleWith(COMPATIBILITY_PETAL_MAPS)
 
     dependsOn(
         androidAutoManifestPatch,

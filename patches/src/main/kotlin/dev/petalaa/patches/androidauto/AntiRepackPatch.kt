@@ -2,6 +2,7 @@ package dev.petalaa.patches.androidauto
 
 import app.morphe.patcher.patch.bytecodePatch
 import app.morphe.util.returnEarly
+import dev.petalaa.patches.androidauto.Constants.COMPATIBILITY_PETAL_MAPS
 
 /**
  * Bytecode patch that neutralizes the native anti-repack integrity check
@@ -20,8 +21,7 @@ val antiRepackPatch = bytecodePatch(
     description = "Neutralizes the native integrity check (SecurityDetect.irpj) " +
             "that kills the process upon detecting APK re-signing.",
 ) {
-    @Suppress("DEPRECATION")
-    compatibleWith("com.huawei.maps.app" to setOf("4.7.0.322(001)"))
+    compatibleWith(COMPATIBILITY_PETAL_MAPS)
 
     execute {
         SecurityDetectIrpjFingerprint.method.returnEarly(false)
