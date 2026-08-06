@@ -1,7 +1,7 @@
 {
-    "version": "1.1.0",
-    "created_at": "2026-08-06T08:10:23",
-    "description": "New patch: **Change package name** — install the patched Petal Maps alongside the original app (default package: morphe.huawei.petal.maps, rewrites permissions and provider authorities).\n\n- **Android Auto**: injects PetalCarAppService and projects the built-in HiCar automotive UI (AutoPetalMapsActivity) onto the head-unit surface via VirtualDisplay, with synthetic pan/zoom/recenter gestures.\n- **Anti-Repack Bypass**: neutralises the native SecurityDetect.irpj() integrity check that kills the process on re-signed APKs.\n- **Manufacturer Check Bypass**: removes the Huawei/Honor-only device gate.",
-    "download_url": "https://github.com/andersonlucasg3/PetalMaps-AndroidAuto/releases/download/v1.1.0/patches-1.1.0.mpp",
+    "version": "1.1.1",
+    "created_at": "2026-08-06T08:22:30",
+    "description": "Fix: bundle rebuilt in the correct task order (classes.dex present). v1.1.0 was published without DEX entries.\n\n- **Android Auto**: injects PetalCarAppService and projects the built-in HiCar automotive UI (AutoPetalMapsActivity) onto the head-unit surface via VirtualDisplay, with synthetic pan/zoom/recenter gestures.\n- **Anti-Repack Bypass**: neutralises the native SecurityDetect.irpj() integrity check that kills the process on re-signed APKs.\n- **Manufacturer Check Bypass**: removes the Huawei/Honor-only device gate.\n- **Change package name**: install alongside the original app (default: morphe.huawei.petal.maps).",
+    "download_url": "https://github.com/andersonlucasg3/PetalMaps-AndroidAuto/releases/download/v1.1.1/patches-1.1.1.mpp",
     "signature_download_url": ""
 }
