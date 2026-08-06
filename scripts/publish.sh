@@ -86,9 +86,11 @@ git diff --cached --quiet && echo "Nothing to commit." || git commit -m "Release
 git push
 
 # ── Step 6/7: GitHub release ────────────────────────────────────────────────
+# NOTE: GITHUB_TOKEN=dummy is only for the Gradle build; unset it for gh,
+# otherwise gh uses the dummy token instead of the keyring credentials.
 echo "=== Step 6/7: Create GitHub release $TAG ==="
-gh release delete "$TAG" --repo "$REPO" --yes 2>/dev/null && echo "Replaced existing $TAG." || true
-gh release create "$TAG" "$MPP" --repo "$REPO" --title "$TAG" --notes "${NOTES:-Release $TAG}"
+env -u GITHUB_TOKEN gh release delete "$TAG" --repo "$REPO" --yes 2>/dev/null && echo "Replaced existing $TAG." || true
+env -u GITHUB_TOKEN gh release create "$TAG" "$MPP" --repo "$REPO" --title "$TAG" --notes "${NOTES:-Release $TAG}"
 
 # ── Step 7/7: Post-publish verification (simulate Morphe Manager) ───────────
 echo "=== Step 7/7: Verify published source (as the Manager sees it) ==="
