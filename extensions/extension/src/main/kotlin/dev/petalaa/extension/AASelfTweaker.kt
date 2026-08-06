@@ -299,9 +299,7 @@ object AASelfTweaker {
         // 4. Copy both dbs (plus WAL/SHM when present) into our private dir.
         val workAppState = File(context.filesDir, WORK_APPSTATE_DB_NAME)
         val workLibrary = File(context.filesDir, WORK_LIBRARY_DB_NAME)
-        if (!copyFinskyDb(LOCAL_APP_STATE_DB_PATH, workAppState) ||
-            !copyFinskyDb(LIBRARY_DB_PATH, workLibrary)
-        ) {
+        if (!copyFinskyDbs(workAppState, workLibrary)) {
             deleteWorkDb(workAppState)
             deleteWorkDb(workLibrary)
             return false
@@ -368,15 +366,9 @@ object AASelfTweaker {
 
             // 7. Push the patched copies back over the originals and restore
             //    ownership/permissions/SELinux context so vending can open them.
-            var pushedBack = true
-            if (appStateDirty) {
-                pushedBack = pushBackFinskyDb(LOCAL_APP_STATE_DB_PATH, workAppState, owner) &&
-                        pushedBack
+            if (!pushBackFinskyDbs(workAppState, workLibrary, owner, appStateDirty, libraryDirty)) {
+                return false
             }
-            if (libraryDirty) {
-                pushedBack = pushBackFinskyDb(LIBRARY_DB_PATH, workLibrary, owner) && pushedBack
-            }
-            if (!pushedBack) return false
 
             // 8. Restart vending and Android Auto so the next bind re-reads
             //    the forged rows.
@@ -467,40 +459,66 @@ object AASelfTweaker {
     }
 
     /** Copies [originalPath] (and -wal/-shm when present) into [workDb]. */
-    private fun copyFinskyDb(originalPath: String, workDb: File): Boolean {
-        val (cpExit, _, cpErr) = runSu("cp $originalPath ${workDb.absolutePath}")
-        if (cpExit != 0) {
-            Log.e(TAG, "Finsky forge: cp of $originalPath failed: $cpErr")
+    /**
+     * Copies both Finsky dbs (and WAL/SHM companions) into our private dir in
+     * a SINGLE su session. Some root solutions hand each `su -c` call a
+     * different mount namespace, which made per-file copies fail with
+     * "No such file or directory" right after `ls` saw the same file.
+     * The result is verified from the app side (exists + readable + writable).
+     */
+    private fun copyFinskyDbs(workAppState: File, workLibrary: File): Boolean {
+        val cmd = "cp $LOCAL_APP_STATE_DB_PATH ${workAppState.absolutePath}; " +
+            "cp $LIBRARY_DB_PATH ${workLibrary.absolutePath}; " +
+            "cp ${LOCAL_APP_STATE_DB_PATH}-wal ${workAppState.absolutePath}-wal 2>/dev/null; " +
+            "cp ${LOCAL_APP_STATE_DB_PATH}-shm ${workAppState.absolutePath}-shm 2>/dev/null; " +
+            "cp ${LIBRARY_DB_PATH}-wal ${workLibrary.absolutePath}-wal 2>/dev/null; " +
+            "cp ${LIBRARY_DB_PATH}-shm ${workLibrary.absolutePath}-shm 2>/dev/null; " +
+            "chmod 666 ${workAppState.absolutePath} ${workLibrary.absolutePath} " +
+            "${workAppState.absolutePath}-wal ${workAppState.absolutePath}-shm " +
+            "${workLibrary.absolutePath}-wal ${workLibrary.absolutePath}-shm 2>/dev/null; " +
+            "true"
+        val (exit, out, err) = runSu(cmd)
+        val ok = workAppState.canRead() && workAppState.canWrite() &&
+            workLibrary.canRead() && workLibrary.canWrite()
+        if (!ok) {
+            Log.e(
+                TAG, "Finsky forge: db copies not usable " +
+                    "(exit=$exit, out='${out.trim()}', err='${err.trim()}')"
+            )
             return false
         }
-        // WAL/SHM companions are optional; ignore failures.
-        runSu("cp $originalPath-wal ${workDb.absolutePath}-wal")
-        runSu("cp $originalPath-shm ${workDb.absolutePath}-shm")
-        // Root-copied files are root-owned; make them readable by our process.
-        runSu("chmod 666 ${workDb.absolutePath} ${workDb.absolutePath}-wal ${workDb.absolutePath}-shm")
         return true
     }
 
     /**
-     * Copies the patched [workDb] back over [originalPath], drops stale
-     * WAL/SHM at the destination, and restores owner/permissions/SELinux
-     * context so Finsky can open the db.
+     * Copies the patched dbs back over the originals in a SINGLE su session,
+     * drops stale WAL/SHM at the destination, and restores owner/permissions/
+     * SELinux context so Finsky can open them.
      */
-    private fun pushBackFinskyDb(originalPath: String, workDb: File, owner: String): Boolean {
-        val (cpExit, _, cpErr) = runSu("cp ${workDb.absolutePath} $originalPath")
-        if (cpExit != 0) {
-            Log.e(TAG, "Finsky forge: failed to copy patched db back to $originalPath: $cpErr")
+    private fun pushBackFinskyDbs(
+        workAppState: File,
+        workLibrary: File,
+        owner: String,
+        pushAppState: Boolean,
+        pushLibrary: Boolean
+    ): Boolean {
+        val parts = mutableListOf<String>()
+        if (pushAppState) parts.add("cp ${workAppState.absolutePath} $LOCAL_APP_STATE_DB_PATH")
+        if (pushLibrary) parts.add("cp ${workLibrary.absolutePath} $LIBRARY_DB_PATH")
+        parts.add(
+            "rm -f $LOCAL_APP_STATE_DB_PATH-wal $LOCAL_APP_STATE_DB_PATH-shm " +
+                "$LIBRARY_DB_PATH-wal $LIBRARY_DB_PATH-shm"
+        )
+        parts.add("chown $owner $LOCAL_APP_STATE_DB_PATH $LIBRARY_DB_PATH")
+        parts.add("chmod 660 $LOCAL_APP_STATE_DB_PATH $LIBRARY_DB_PATH")
+        val cmd = parts.joinToString(" && ") +
+            "; restorecon $LOCAL_APP_STATE_DB_PATH $LIBRARY_DB_PATH 2>/dev/null || true"
+        val (exit, _, err) = runSu(cmd)
+        if (exit != 0) {
+            Log.e(TAG, "Finsky forge: failed to copy patched dbs back (exit=$exit): ${err.trim()}")
             return false
         }
-        runSu("rm -f $originalPath-wal $originalPath-shm")
-        runSu("chown $owner $originalPath")
-        runSu("chmod 660 $originalPath")
-        val (rcExit, _, rcErr) = runSu("restorecon $originalPath")
-        if (rcExit != 0) {
-            // restorecon may not exist on some ROMs — not fatal.
-            Log.d(TAG, "Finsky forge: restorecon failed/absent (exit=$rcExit): $rcErr")
-        }
-        Log.i(TAG, "Finsky forge: patched db restored to $originalPath")
+        Log.i(TAG, "Finsky forge: patched dbs restored")
         return true
     }
 
