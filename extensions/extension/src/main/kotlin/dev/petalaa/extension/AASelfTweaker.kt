@@ -94,10 +94,13 @@ object AASelfTweaker {
     // ---- Core flow ---------------------------------------------------------
 
     private fun checkAndRegister(context: Context) {
-        // 1. Root check: `su -c id` must report uid=0.
-        val (idExit, idOut, idErr) = runSu("id")
-        if (idExit != 0 || !idOut.contains("uid=0")) {
-            Log.w(TAG, "Root not available (exit=$idExit, out='$idOut', err='$idErr') — skipping")
+        // 1. Root check: `su -c id` must report uid=0. Prefer the GLOBAL mount
+        //    namespace (--mount-master): ROMs like HyperOS overlay /data/data
+        //    with a tmpfs in the app's namespace, hiding other packages' data
+        //    (e.g. com.android.vending) from plain `su`.
+        val rooted = detectSuArgs()
+        if (!rooted) {
+            Log.w(TAG, "Root not available — skipping")
             return
         }
 
@@ -803,6 +806,38 @@ object AASelfTweaker {
 
     // ---- Shell / UI helpers -------------------------------------------------
 
+    /** su invocation prefix, detected once by [detectSuArgs]. */
+    @Volatile
+    private var suArgs: List<String> = listOf("su", "--mount-master", "-c")
+
+    /**
+     * Detects a working root invocation, preferring the global mount
+     * namespace (--mount-master): ROMs like HyperOS overlay /data/data with a
+     * tmpfs in the app's mount namespace, hiding other packages' data from a
+     * plain `su` spawned by the app. Returns true when root is usable.
+     */
+    private fun detectSuArgs(): Boolean {
+        val candidates = listOf(
+            listOf("su", "--mount-master", "-c"),
+            listOf("su", "-M", "-c"),
+            listOf("su", "-c")
+        )
+        for (args in candidates) {
+            val out = runCatching {
+                val process = ProcessBuilder(*args.toTypedArray(), "id").start()
+                val stdout = process.inputStream.bufferedReader().readText()
+                process.waitFor()
+                stdout
+            }.getOrNull() ?: continue
+            if (out.contains("uid=0")) {
+                suArgs = args
+                Log.i(TAG, "Root OK via: ${args.joinToString(" ")}")
+                return true
+            }
+        }
+        return false
+    }
+
     /**
      * Runs [command] through `su -c`, returning (exitCode, stdout, stderr).
      * On timeout the process is destroyed and exit code -1 is returned.
@@ -810,7 +845,7 @@ object AASelfTweaker {
      */
     private fun runSu(command: String, timeoutSec: Int = 15): Triple<Int, String, String> {
         return try {
-            val process = ProcessBuilder("su", "-c", command).start()
+            val process = ProcessBuilder(*suArgs.toTypedArray(), command).start()
             // Drain both streams concurrently to avoid pipe-buffer deadlock.
             var stdout = ""
             var stderr = ""
