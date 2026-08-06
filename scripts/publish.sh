@@ -51,7 +51,10 @@ TAG="v$NEW"
 # ── Step 2/7: Build — ORDER MATTERS ─────────────────────────────────────────
 # generatePatchesList depends on 'build', which re-creates the plain JVM jar.
 # buildAndroid must run LAST so classes.dex is added after the jar is final.
+# PatchListGenerator picks the FIRST .mpp found in build/libs/, so stale
+# bundles from previous versions must be removed first.
 echo "=== Step 2/7: Build patches (generatePatchesList, then buildAndroid) ==="
+rm -f patches/build/libs/*.mpp
 ./gradlew :patches:generatePatchesList --no-daemon
 ./gradlew :patches:buildAndroid --no-daemon
 
