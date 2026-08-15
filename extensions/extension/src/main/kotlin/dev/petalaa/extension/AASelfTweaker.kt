@@ -111,12 +111,8 @@ object AASelfTweaker {
     // ---- Core flow ---------------------------------------------------------
 
     private fun checkAndRegister(context: Context) {
-        // 1. Root check: `su -c id` must report uid=0. Prefer the GLOBAL mount
-        //    namespace (--mount-master): ROMs like HyperOS overlay /data/data
-        //    with a tmpfs in the app's namespace, hiding other packages' data
-        //    (e.g. com.android.vending) from plain `su`.
-        val rooted = detectSuArgs()
-        if (!rooted) {
+        // 1. Root check via shared RootShell helper.
+        if (!RootShell.detect()) {
             AALogger.w("Root not available — skipping")
             return
         }
@@ -266,7 +262,7 @@ object AASelfTweaker {
         // 4. Run the re-install via root. This kills our process on success.
         val cmd = "pm install -r -t -i $VENDING_PACKAGE $sourceDir"
         AALogger.i("Executing: $cmd")
-        val (exit, out, err) = runSu(cmd, timeoutSec = 60)
+        val (exit, out, err) = RootShell.run(cmd, timeoutSec = 60)
         val success = exit == 0 && out.contains("Success", ignoreCase = true)
 
         // Persist guard state BEFORE the process dies (on success) so the next
@@ -295,10 +291,10 @@ object AASelfTweaker {
      */
     private fun ensurePhenotypeOverrides(context: Context, ourPackage: String): Boolean {
         // 1. Kill GMS first so it does not rewrite the db while we work on it.
-        runSu("am kill all $GMS_PACKAGE")
+        RootShell.run("am kill all $GMS_PACKAGE")
 
         // 2. Snapshot uid/gid of the original db for later restoration.
-        val (statExit, statOut, _) = runSu("stat -c '%u %g' $PHENOTYPE_DB_PATH")
+        val (statExit, statOut, _) = RootShell.run("stat -c '%u %g' $PHENOTYPE_DB_PATH")
         val ownerIds = statOut.trim().split(Regex("\\s+"))
         if (statExit != 0 || ownerIds.size < 2) {
             AALogger.w("Could not stat phenotype.db (exit=$statExit, out='$statOut') — skipping")
@@ -357,7 +353,7 @@ object AASelfTweaker {
             }
 
             // 6. Push the patched copy back over the original.
-            val (cpExit, _, cpErr) = runSu("cp ${workDb.absolutePath} $PHENOTYPE_DB_PATH")
+            val (cpExit, _, cpErr) = RootShell.run("cp ${workDb.absolutePath} $PHENOTYPE_DB_PATH")
             if (cpExit != 0) {
                 AALogger.e("Failed to copy patched db back: $cpErr")
                 return false
@@ -366,21 +362,21 @@ object AASelfTweaker {
 
             // 6b. Drop stale WAL/SHM at the destination so GMS cannot replay an
             //     old journal over the patched db.
-            val (rmExit, _, rmErr) = runSu("rm -f $PHENOTYPE_DB_PATH-wal $PHENOTYPE_DB_PATH-shm")
+            val (rmExit, _, rmErr) = RootShell.run("rm -f $PHENOTYPE_DB_PATH-wal $PHENOTYPE_DB_PATH-shm")
             if (rmExit != 0) {
                 AALogger.w("rm of stale -wal/-shm failed (exit=$rmExit): $rmErr")
             }
 
             // 7. Restore ownership and SELinux context so GMS can open the db.
-            runSu("chown $uid:$gid $PHENOTYPE_DB_PATH")
-            val (rcExit, _, rcErr) = runSu("restorecon $PHENOTYPE_DB_PATH")
+            RootShell.run("chown $uid:$gid $PHENOTYPE_DB_PATH")
+            val (rcExit, _, rcErr) = RootShell.run("restorecon $PHENOTYPE_DB_PATH")
             if (rcExit != 0) {
                 // restorecon may not exist on some ROMs — not fatal.
                 AALogger.d("restorecon failed/absent (exit=$rcExit): $rcErr")
             }
 
             // 8. Restart Android Auto so it re-reads the flags.
-            runSu("am force-stop $GEARHEAD_PACKAGE")
+            RootShell.run("am force-stop $GEARHEAD_PACKAGE")
 
             success = true
         } catch (t: Throwable) {
@@ -423,14 +419,14 @@ object AASelfTweaker {
         AALogger.i("Finsky forge: certificate hash='$hash'")
 
         // 2. Stop vending so it does not rewrite the dbs while we work on them.
-        runSu("am force-stop $VENDING_PACKAGE")
+        RootShell.run("am force-stop $VENDING_PACKAGE")
 
         // 3. Discover the owner (uid:gid) of the vending dbs at runtime —
         //    it varies by device/ROM and must never be hardcoded.
         //    `ls -ln` is available everywhere; `stat -c` misbehaves in some
         //    root shells when called from an app process.
         var owner = ""
-        val (lsExit, lsOut, _) = runSu("ls -ln $LOCAL_APP_STATE_DB_PATH")
+        val (lsExit, lsOut, _) = RootShell.run("ls -ln $LOCAL_APP_STATE_DB_PATH")
         if (lsExit == 0) {
             // -rw-rw---- 1 10150 10150 ... -> fields[2]=uid fields[3]=gid
             val parts = lsOut.trim().split(Regex("\\s+"))
@@ -440,7 +436,7 @@ object AASelfTweaker {
         }
         if (owner.isEmpty()) {
             // Fallback: "package:com.android.vending uid:10150,1010150,..."
-            val (_, pkgOut, _) = runSu("cmd package list packages -U $VENDING_PACKAGE")
+            val (_, pkgOut, _) = RootShell.run("cmd package list packages -U $VENDING_PACKAGE")
             val uidMatch = Regex("uid:(\\d+)").find(pkgOut)
             if (uidMatch != null) {
                 owner = "${uidMatch.groupValues[1]}:${uidMatch.groupValues[1]}"
@@ -536,8 +532,8 @@ object AASelfTweaker {
 
             // 8. Restart vending and Android Auto so the next bind re-reads
             //    the forged rows.
-            runSu("am force-stop $VENDING_PACKAGE")
-            runSu("am force-stop $GEARHEAD_PACKAGE")
+            RootShell.run("am force-stop $VENDING_PACKAGE")
+            RootShell.run("am force-stop $GEARHEAD_PACKAGE")
 
             AALogger.i(
                 "Finsky forge: rows forged for '$pkg' " +
@@ -578,7 +574,7 @@ object AASelfTweaker {
      */
     private fun warmUpPlayStore(): Boolean {
         // Step 1: Battery whitelist — idempotent, always run.
-        val (wlExit, wlOut, wlErr) = runSu("dumpsys deviceidle whitelist +$VENDING_PACKAGE")
+        val (wlExit, wlOut, wlErr) = RootShell.run("dumpsys deviceidle whitelist +$VENDING_PACKAGE")
         if (wlExit == 0) {
             AALogger.i("Play warmup: battery whitelist added ($VENDING_PACKAGE)")
         } else {
@@ -594,7 +590,7 @@ object AASelfTweaker {
         //            android:exported="true"/>
         // (see: https://gist.github.com/daniiielsistrapped/68621e491b4b6ac7e40b5107b190dbea)
         val serviceComponent = "$VENDING_PACKAGE/com.google.android.finsky.services.PlayGearheadService"
-        val (svcExit, svcOut, svcErr) = runSu("am startservice -n $serviceComponent", timeoutSec = 10)
+        val (svcExit, svcOut, svcErr) = RootShell.run("am startservice -n $serviceComponent", timeoutSec = 10)
         if (svcExit == 0 || svcOut.contains("Started", ignoreCase = true)) {
             AALogger.i("Play warmup: PlayGearheadService started via explicit component")
             return true
@@ -606,7 +602,7 @@ object AASelfTweaker {
 
         // Step 3: Fallback — start the Play Store main activity (brings up UI,
         // but reliably starts the process with all services).
-        val (actExit, actOut, actErr) = runSu(
+        val (actExit, actOut, actErr) = RootShell.run(
             "am start -n $VENDING_PACKAGE/com.google.android.finsky.activities.MainActivity",
             timeoutSec = 10
         )
@@ -622,7 +618,7 @@ object AASelfTweaker {
         // Step 4: Last resort — monkey to launch the Play Store process.
         // This is ugly (flashes UI) but is the most reliable way to start
         // the process on stubborn ROMs.
-        val (mkExit, mkOut, mkErr) = runSu(
+        val (mkExit, mkOut, mkErr) = RootShell.run(
             "monkey -p $VENDING_PACKAGE -c android.intent.category.LAUNCHER 1",
             timeoutSec = 15
         )
@@ -746,7 +742,7 @@ object AASelfTweaker {
             "${workAppState.absolutePath}-wal ${workAppState.absolutePath}-shm " +
             "${workLibrary.absolutePath}-wal ${workLibrary.absolutePath}-shm 2>/dev/null; " +
             "true"
-        val (exit, out, err) = runSu(cmd)
+        val (exit, out, err) = RootShell.run(cmd)
         val ok = workAppState.canRead() && workAppState.canWrite() &&
             workLibrary.canRead() && workLibrary.canWrite()
         if (!ok) {
@@ -782,7 +778,7 @@ object AASelfTweaker {
         parts.add("chmod 660 $LOCAL_APP_STATE_DB_PATH $LIBRARY_DB_PATH")
         val cmd = parts.joinToString(" && ") +
             "; restorecon $LOCAL_APP_STATE_DB_PATH $LIBRARY_DB_PATH 2>/dev/null || true"
-        val (exit, _, err) = runSu(cmd)
+        val (exit, _, err) = RootShell.run(cmd)
         if (exit != 0) {
             AALogger.e("Finsky forge: failed to copy patched dbs back (exit=$exit): ${err.trim()}")
             return false
@@ -819,16 +815,16 @@ object AASelfTweaker {
 
     /** Copies phenotype.db (and -wal/-shm when present) into [workDb]. */
     private fun copyDbToWorkDir(workDb: File): Boolean {
-        val (cpExit, _, cpErr) = runSu("cp $PHENOTYPE_DB_PATH ${workDb.absolutePath}")
+        val (cpExit, _, cpErr) = RootShell.run("cp $PHENOTYPE_DB_PATH ${workDb.absolutePath}")
         if (cpExit != 0) {
             AALogger.e("cp of phenotype.db failed: $cpErr")
             return false
         }
         // WAL/SHM companions are optional; ignore failures.
-        runSu("cp $PHENOTYPE_DB_PATH-wal ${workDb.absolutePath}-wal")
-        runSu("cp $PHENOTYPE_DB_PATH-shm ${workDb.absolutePath}-shm")
+        RootShell.run("cp $PHENOTYPE_DB_PATH-wal ${workDb.absolutePath}-wal")
+        RootShell.run("cp $PHENOTYPE_DB_PATH-shm ${workDb.absolutePath}-shm")
         // Root-copied files are root-owned; make them readable by our process.
-        runSu("chmod 666 ${workDb.absolutePath} ${workDb.absolutePath}-wal ${workDb.absolutePath}-shm")
+        RootShell.run("chmod 666 ${workDb.absolutePath} ${workDb.absolutePath}-wal ${workDb.absolutePath}-shm")
         return true
     }
 
@@ -1070,83 +1066,7 @@ object AASelfTweaker {
         }
     }
 
-    // ---- Shell / UI helpers -------------------------------------------------
-
-    /** su invocation prefix, detected once by [detectSuArgs]. */
-    @Volatile
-    private var suArgs: List<String> = listOf("su", "--mount-master", "-c")
-
-    /**
-     * Detects a working root invocation, preferring the global mount
-     * namespace (--mount-master): ROMs like HyperOS overlay /data/data with a
-     * tmpfs in the app's mount namespace, hiding other packages' data from a
-     * plain `su` spawned by the app. Returns true when root is usable.
-     */
-    private fun detectSuArgs(): Boolean {
-        val candidates = listOf(
-            listOf("su", "--mount-master", "-c"),
-            listOf("su", "-M", "-c"),
-            listOf("su", "-c")
-        )
-        for (args in candidates) {
-            val out = runCatching {
-                val process = ProcessBuilder(*args.toTypedArray(), "id").start()
-                val stdout = process.inputStream.bufferedReader().readText()
-                process.waitFor()
-                stdout
-            }.getOrNull() ?: continue
-            if (out.contains("uid=0")) {
-                suArgs = args
-                AALogger.i("Root OK via: ${args.joinToString(" ")}")
-                return true
-            }
-        }
-        return false
-    }
-
-    /**
-     * Runs [command] through `su -c`, returning (exitCode, stdout, stderr).
-     * On timeout the process is destroyed and exit code -1 is returned.
-     * Never throws.
-     */
-    private fun runSu(command: String, timeoutSec: Int = 15): Triple<Int, String, String> {
-        return try {
-            val process = ProcessBuilder(*suArgs.toTypedArray(), command).start()
-            // Drain both streams concurrently to avoid pipe-buffer deadlock.
-            var stdout = ""
-            var stderr = ""
-            val outThread = Thread {
-                stdout = process.inputStream.bufferedReader().readText()
-            }.apply { isDaemon = true; start() }
-            val errThread = Thread {
-                stderr = process.errorStream.bufferedReader().readText()
-            }.apply { isDaemon = true; start() }
-            // Manual wait loop with timeout: Process.waitFor(long, TimeUnit)
-            // and destroyForcibly() require API 26, but our minSdk is 23.
-            val deadlineMs = System.currentTimeMillis() + timeoutSec * 1000L
-            var exitCode: Int? = null
-            while (System.currentTimeMillis() < deadlineMs) {
-                try {
-                    exitCode = process.exitValue()
-                    break
-                } catch (_: IllegalThreadStateException) {
-                    Thread.sleep(50)
-                }
-            }
-            outThread.join(1000)
-            errThread.join(1000)
-            if (exitCode == null) {
-                process.destroy()
-                AALogger.w("su command timed out after ${timeoutSec}s: $command")
-                Triple(-1, stdout, stderr)
-            } else {
-                Triple(exitCode, stdout, stderr)
-            }
-        } catch (t: Throwable) {
-            AALogger.e("runSu failed for: $command", t)
-            Triple(-1, "", t.message ?: "")
-        }
-    }
+    // ---- UI helpers -------------------------------------------------
 
     private fun showToast(context: Context, message: String) {
         Handler(Looper.getMainLooper()).post {

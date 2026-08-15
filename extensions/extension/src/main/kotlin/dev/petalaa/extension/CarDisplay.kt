@@ -1,7 +1,6 @@
 package dev.petalaa.extension
 
 import android.app.Activity
-import android.app.ActivityOptions
 import android.app.Application
 import android.content.Context
 import android.content.Intent
@@ -195,28 +194,63 @@ class CarDisplay(
         // can catch onActivityCreated and auto-attach it.
         registerLifecycleCallbacks()
 
-        // Launch the activity on the virtual display
-        try {
-            val intent = buildLaunchIntent()
-            val options = ActivityOptions.makeBasic()
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                options.launchDisplayId = displayId
+        // Launch the activity on the virtual display via `am start` as root.
+        // Ordinary apps cannot use ActivityOptions.setLaunchDisplayId on a
+        // VirtualDisplay they own (SecurityException: Permission Denial).
+        // The `am start --display <id>` approach works because it runs as
+        // system server via su.
+        val componentName = "${context.packageName}/$targetActivityClass"
+        // Flags: NEW_TASK(0x10000000) | MULTIPLE_TASK(0x00080000) | EXCLUDE_FROM_RECENTS(0x00002000)
+        val flagsDecimal = 0x10000000 or 0x00080000 or 0x00002000 // 269967936
+        val amCmd = "am start -n $componentName --display $displayId -f $flagsDecimal"
+        AALogger.i("CarDisplay: launching via root: $amCmd")
+
+        val (exitCode, stdout, stderr) = RootShell.run(amCmd, timeoutSec = 15)
+        val rootLaunchOk = (exitCode == 0 || stdout.contains("StartActivity", ignoreCase = true))
+
+        if (rootLaunchOk) {
+            AALogger.i("CarDisplay: am start succeeded (exit=$exitCode)")
+            AALogger.d("CarDisplay: am start stdout=${stdout.trim()}")
+            if (stderr.isNotBlank()) {
+                AALogger.d("CarDisplay: am start stderr=${stderr.trim()}")
             }
-            @Suppress("DEPRECATION")
-            context.startActivity(intent, options.toBundle())
-            AALogger.i("Activity launch requested on display $displayId")
-        } catch (e: SecurityException) {
-            AALogger.e("SecurityException launching activity on VirtualDisplay: ${e.message}", e)
-            destroy()
-            return false
-        } catch (e: IllegalStateException) {
-            AALogger.e("IllegalStateException launching activity on VirtualDisplay: ${e.message}", e)
-            destroy()
-            return false
-        } catch (e: Exception) {
-            AALogger.e("Failed to launch activity on VirtualDisplay: ${e.message}", e)
-            destroy()
-            return false
+        } else {
+            AALogger.w(
+                "CarDisplay: am start failed (exit=$exitCode, out='${stdout.trim()}', " +
+                    "err='${stderr.trim()}') — falling back to startActivity()"
+            )
+            // Fallback: try the original startActivity with launchDisplayId.
+            // This will likely fail with SecurityException on VirtualDisplay,
+            // but we keep it for completeness (e.g. if the ROM allows it).
+            try {
+                val intent = Intent(Intent.ACTION_VIEW).apply {
+                    setClassName(context.packageName, targetActivityClass)
+                    addFlags(
+                        Intent.FLAG_ACTIVITY_NEW_TASK or
+                        Intent.FLAG_ACTIVITY_MULTIPLE_TASK or
+                        Intent.FLAG_ACTIVITY_EXCLUDE_FROM_RECENTS
+                    )
+                }
+                val options = android.app.ActivityOptions.makeBasic()
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    options.launchDisplayId = displayId
+                }
+                @Suppress("DEPRECATION")
+                context.startActivity(intent, options.toBundle())
+                AALogger.i("CarDisplay: fallback startActivity succeeded")
+            } catch (e: SecurityException) {
+                AALogger.e("CarDisplay: fallback startActivity blocked: ${e.message}", e)
+                destroy()
+                return false
+            } catch (e: IllegalStateException) {
+                AALogger.e("CarDisplay: fallback startActivity error: ${e.message}", e)
+                destroy()
+                return false
+            } catch (e: Exception) {
+                AALogger.e("CarDisplay: fallback startActivity failed: ${e.message}", e)
+                destroy()
+                return false
+            }
         }
 
         return true
@@ -546,16 +580,4 @@ class CarDisplay(
         }
     }
 
-    // ---- internal helpers ------------------------------------------------
-
-    private fun buildLaunchIntent(): Intent {
-        return Intent(Intent.ACTION_VIEW).apply {
-            setClassName(context.packageName, targetActivityClass)
-            addFlags(
-                Intent.FLAG_ACTIVITY_NEW_TASK or
-                Intent.FLAG_ACTIVITY_MULTIPLE_TASK or
-                Intent.FLAG_ACTIVITY_EXCLUDE_FROM_RECENTS
-            )
-        }
     }
-}
