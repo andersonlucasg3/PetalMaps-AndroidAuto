@@ -473,8 +473,9 @@ object AASelfTweaker {
                 runCatching { appStateDb.close() }
             }
 
-            // 6. ownership: idempotency is keyed on OUR certificate hash — a
-            //    stale row with an old hash (re-signed APK) does not count.
+            // 6. ownership: discover a real Play account from the db, then check/insert.
+            //    The Finsky service queries with account!='' and backend=3;
+            //    rows with account='' (from old forges) are ignored by it.
             val libraryDb = SQLiteDatabase.openDatabase(
                 workLibrary.absolutePath, null, SQLiteDatabase.OPEN_READWRITE
             )
@@ -483,15 +484,21 @@ object AASelfTweaker {
                     AALogger.w("Finsky forge: 'ownership' table missing — unsupported schema")
                     return false
                 }
+                val account = discoverFinskyAccount(libraryDb)
+                AALogger.i("Finsky forge: discovered account='$account'")
+                // Idempotency: a row counts only if it matches the account and
+                // backend the Finsky service actually queries (backend=3).
+                // Old rows with account='' or backend=0 do NOT satisfy this.
                 if (rowExists(
                         libraryDb,
-                        "SELECT 1 FROM ownership WHERE doc_id=? AND app_certificate_hash=?",
-                        arrayOf(pkg, hash)
+                        "SELECT 1 FROM ownership WHERE doc_id=? AND app_certificate_hash=? " +
+                            "AND account=? AND backend=3",
+                        arrayOf(pkg, hash, account)
                     )
                 ) {
-                    AALogger.i("Finsky forge: ownership row with our hash already present")
+                    AALogger.i("Finsky forge: ownership row with our hash already present (account='$account')")
                 } else {
-                    insertOwnershipRows(libraryDb, pkg, hash)
+                    insertOwnershipRows(libraryDb, pkg, hash, account)
                     libraryDirty = true
                 }
                 checkpointWal(libraryDb)
@@ -573,28 +580,47 @@ object AASelfTweaker {
     }
 
     /**
-     * INSERT OR REPLACE the two ownership rows:
+ * Discovers a real Google account from the ownership table so our forged
+ * rows match the schema the Finsky service actually queries. Returns "" if
+ * no account is found (device without a logged-in Play account).
+ */
+    private fun discoverFinskyAccount(db: SQLiteDatabase): String {
+        return runCatching {
+            db.rawQuery("SELECT account FROM ownership WHERE account != '' LIMIT 1", null).use {
+                if (it.moveToFirst()) it.getString(0) else ""
+            }
+        }.getOrElse {
+            ""
+        }
+    }
+
+    /**
+     * INSERT OR REPLACE the two ownership rows mirroring a Play-installed app:
      *   1. library "u-tpl" — empty certificate hash (match-all entry).
      *   2. library "3"     — our [hash], shareability=2.
-     * Column set mirrors the forge validated on-device (no offer_type column).
+     *
+     * Columns match the real rows the Finsky service queries:
+     *   account=<discovered>, backend=3, doc_type=1, offer_type=1.
+     * Using backend=0 or account='' causes the PlayGearheadService query to
+     * return empty, leading to "app owners empty" rejection.
      */
-    private fun insertOwnershipRows(db: SQLiteDatabase, pkg: String, hash: String) {
+    private fun insertOwnershipRows(db: SQLiteDatabase, pkg: String, hash: String, account: String) {
         val now = System.currentTimeMillis()
-        AALogger.i("Finsky forge: INSERT ownership doc_id='$pkg' library_id='u-tpl' hash=''")
+        AALogger.i("Finsky forge: INSERT ownership doc_id='$pkg' library_id='u-tpl' account='$account' hash=''")
         db.execSQL(
             "INSERT OR REPLACE INTO ownership(" +
-                "library_id,backend,account,doc_id,doc_type," +
+                "library_id,backend,account,doc_id,doc_type,offer_type," +
                 "app_certificate_hash,shareability,purchase_time" +
-                ") VALUES ('u-tpl',0,'',?,1,'',2,?)",
-            arrayOf<Any>(pkg, now)
+                ") VALUES ('u-tpl',3,?,?,'1',1,'',2,?)",
+            arrayOf<Any>(account, pkg, now)
         )
-        AALogger.i("Finsky forge: INSERT ownership doc_id='$pkg' library_id='3' hash='$hash'")
+        AALogger.i("Finsky forge: INSERT ownership doc_id='$pkg' library_id='3' account='$account' hash='$hash'")
         db.execSQL(
             "INSERT OR REPLACE INTO ownership(" +
-                "library_id,backend,account,doc_id,doc_type," +
+                "library_id,backend,account,doc_id,doc_type,offer_type," +
                 "app_certificate_hash,shareability,purchase_time" +
-                ") VALUES ('3',0,'',?,1,?,2,?)",
-            arrayOf<Any>(pkg, hash, now)
+                ") VALUES ('3',3,?,?,'1',1,?,2,?)",
+            arrayOf<Any>(account, pkg, hash, now)
         )
     }
 
