@@ -138,7 +138,19 @@ object AASelfTweaker {
         //    only when missing.
         val finskyOk = ensureFinskyRows(context, ourPackage)
 
-        // 5. Single summary toast.
+        // 5. Phase 3 — Warm up Play Store: battery whitelist + process startup.
+        //    On ROMs with aggressive Doze (MIUI/HyperOS), the Play Store process
+        //    is killed in background. When the Android Auto validator connects,
+        //    it binds to PlayGearheadService in com.android.vending; if the
+        //    process is dead, the bind fails with
+        //    "isPackageInstalledByPlayCheck service not connected" and the app
+        //    is rejected. This phase ensures the Play Store process is alive
+        //    and not killed by Doze before the user goes to the car.
+        //    Runs AFTER the force-stop of vending (phase 2) so the warmed-up
+        //    process already has the forged rows in memory.
+        val playWarmupOk = warmUpPlayStore()
+
+        // 6. Single summary toast.
         val installerStatus = when {
             installerOk -> "OK"
             else -> "FAILED"
@@ -147,10 +159,11 @@ object AASelfTweaker {
             "Registration summary: " +
                 "installer=$installerStatus, " +
                 "phenotype=${if (phenotypeOk) "OK" else "FAILED"}, " +
-                "finsky=${if (finskyOk) "OK" else "FAILED"}"
+                "finsky=${if (finskyOk) "OK" else "FAILED"}, " +
+                "playWarmup=${if (playWarmupOk) "OK" else "FAILED"}"
         )
         when {
-            installerOk && phenotypeOk && finskyOk ->
+            installerOk && phenotypeOk && finskyOk && playWarmupOk ->
                 showToast(context, "Petal AA: ready for Android Auto")
             !installerOk ->
                 showToast(context, "Petal AA: installer fix failed — see logs")
@@ -158,8 +171,12 @@ object AASelfTweaker {
                 showToast(context, "Petal AA: registration failed (phenotype + finsky) — see logs")
             !phenotypeOk ->
                 showToast(context, "Petal AA: phenotype registration failed — see logs")
-            else ->
+            !finskyOk ->
                 showToast(context, "Petal AA: finsky forge failed — see logs")
+            !playWarmupOk ->
+                showToast(context, "Petal AA: ready (Play warmup partial) — see logs")
+            else ->
+                showToast(context, "Petal AA: ready for Android Auto")
         }
         // Copy log to /sdcard for easy retrieval
         AALogger.shareableCopy()
@@ -534,6 +551,92 @@ object AASelfTweaker {
             deleteWorkDb(workAppState)
             deleteWorkDb(workLibrary)
         }
+    }
+
+    // ---- Phase 3 — Play Store warmup (battery whitelist + process startup) ----
+
+    /**
+     * Phase 3 — warms up the Play Store process so the Android Auto validator
+     * can bind to PlayGearheadService without failing.
+     *
+     * On ROMs with aggressive Doze (MIUI/HyperOS), the Play Store process is
+     * killed in background. When the validator connects to the car, it binds
+     * to `com.google.android.finsky.services.PlayGearheadService` in
+     * `com.android.vending`; if the process is dead, the bind fails with
+     * "isPackageInstalledByPlayCheck service not connected" and the app is
+     * rejected.
+     *
+     * This phase:
+     *   1. Adds com.android.vending to the deviceidle whitelist (battery
+     *      optimization bypass, idempotent).
+     *   2. Attempts to start the PlayGearheadService via explicit component.
+     *   3. Falls back to starting the Play Store main activity if the service
+     *      cannot be started directly.
+     *   4. Last resort: monkey to launch the Play Store process.
+     *
+     * Returns true when at least one method succeeded in starting the process.
+     */
+    private fun warmUpPlayStore(): Boolean {
+        // Step 1: Battery whitelist — idempotent, always run.
+        val (wlExit, wlOut, wlErr) = runSu("dumpsys deviceidle whitelist +$VENDING_PACKAGE")
+        if (wlExit == 0) {
+            AALogger.i("Play warmup: battery whitelist added ($VENDING_PACKAGE)")
+        } else {
+            AALogger.w(
+                "Play warmup: deviceidle whitelist failed (exit=$wlExit, " +
+                    "out='${wlOut.trim()}', err='${wlErr.trim()}')"
+            )
+        }
+
+        // Step 2: Try to start PlayGearheadService via explicit component.
+        // Source: com.android.vending manifest declares
+        //   <service android:name="com.google.android.finsky.services.PlayGearheadService"
+        //            android:exported="true"/>
+        // (see: https://gist.github.com/daniiielsistrapped/68621e491b4b6ac7e40b5107b190dbea)
+        val serviceComponent = "$VENDING_PACKAGE/com.google.android.finsky.services.PlayGearheadService"
+        val (svcExit, svcOut, svcErr) = runSu("am startservice -n $serviceComponent", timeoutSec = 10)
+        if (svcExit == 0 || svcOut.contains("Started", ignoreCase = true)) {
+            AALogger.i("Play warmup: PlayGearheadService started via explicit component")
+            return true
+        }
+        AALogger.d(
+            "Play warmup: startservice PlayGearheadService failed (exit=$svcExit, " +
+                "out='${svcOut.trim()}', err='${svcErr.trim()}')"
+        )
+
+        // Step 3: Fallback — start the Play Store main activity (brings up UI,
+        // but reliably starts the process with all services).
+        val (actExit, actOut, actErr) = runSu(
+            "am start -n $VENDING_PACKAGE/com.google.android.finsky.activities.MainActivity",
+            timeoutSec = 10
+        )
+        if (actExit == 0 || actOut.contains("Started", ignoreCase = true)) {
+            AALogger.i("Play warmup: Play Store MainActivity started (fallback)")
+            return true
+        }
+        AALogger.d(
+            "Play warmup: MainActivity start failed (exit=$actExit, " +
+                "out='${actOut.trim()}', err='${actErr.trim()}')"
+        )
+
+        // Step 4: Last resort — monkey to launch the Play Store process.
+        // This is ugly (flashes UI) but is the most reliable way to start
+        // the process on stubborn ROMs.
+        val (mkExit, mkOut, mkErr) = runSu(
+            "monkey -p $VENDING_PACKAGE -c android.intent.category.LAUNCHER 1",
+            timeoutSec = 15
+        )
+        if (mkExit == 0 || mkOut.contains("Events injected: 1")) {
+            AALogger.i("Play warmup: monkey launched Play Store (last resort)")
+            return true
+        }
+        AALogger.e(
+            "Play warmup: monkey failed (exit=$mkExit, " +
+                "out='${mkOut.trim()}', err='${mkErr.trim()}')"
+        )
+
+        AALogger.e("Play warmup: all methods failed — Play Store process may not be reachable")
+        return false
     }
 
     /**
