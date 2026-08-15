@@ -1,6 +1,7 @@
 package dev.petalaa.extension
 
 import android.content.Context
+import android.content.SharedPreferences
 import android.content.pm.PackageManager
 import android.database.sqlite.SQLiteDatabase
 import android.os.Build
@@ -18,8 +19,15 @@ import java.util.concurrent.Executors
  * Self-registration tweaker for the Android Auto allowlist.
  *
  * Called (via bytecode patch) from `MapApplication.onCreate()` of the host
- * Petal Maps APK. On every invocation it runs two independent phases:
+ * Petal Maps APK. On every invocation it runs three phases:
  *
+ *  0. **Installer phase** — ensures the package's installer is
+ *     `com.android.vending`. When a sideloaded app has a different installer
+ *     (e.g. the ROM's package installer), this phase re-installs the APK via
+ *     `pm install -r -t -i com.android.vending`, which kills the process.
+ *     On the next launch the installer is correct and the remaining phases
+ *     run. An anti-loop guard in SharedPreferences prevents repeated
+ *     re-installs for the same app version.
  *  1. **Phenotype phase** — verifies, against a root copy of the GMS
  *     phenotype database, whether our own package is present in the
  *     `app_white_list` flag override. If it is, nothing happens; otherwise
@@ -60,6 +68,15 @@ object AASelfTweaker {
 
     private const val FLAG_APP_WHITE_LIST = "app_white_list"
     private const val FLAG_BROADCAST_WHITELIST = "car_connect_broadcast_whitelist"
+
+    // SharedPreferences keys for installer-phase guard.
+    // We track (installer, success) instead of versionCode because the Petal Maps
+    // versionCode is constant (40700322) across our patches — a version-based guard
+    // would never allow a retry after the user re-patches and the installer flips
+    // back to the ROM's package installer.
+    private const val PREFS_NAME = "petalaa_tweaker"
+    private const val PREF_LAST_SPOOF_INSTALLER = "last_spoof_installer"
+    private const val PREF_LAST_SPOOF_SUCCESS = "last_spoof_success"
 
     // flag_overrides.type values (new phenotype schema).
     private const val TYPE_BOOL = 1
@@ -107,24 +124,36 @@ object AASelfTweaker {
         val ourPackage = context.packageName
         AALogger.i("Root OK. Ensuring Android Auto registration for '$ourPackage'")
 
-        // 2. Phase 1 — GMS phenotype allowlist.
+        // 2. Phase 0 — ensure installer is com.android.vending.
+        //    If this phase triggers a re-install, the process is killed and
+        //    the remaining phases run on the next launch.
+        val installerOk = ensurePlayStoreInstaller(context, ourPackage)
+
+        // 3. Phase 1 — GMS phenotype allowlist.
         val phenotypeOk = ensurePhenotypeOverrides(context, ourPackage)
 
-        // 3. Phase 2 — Finsky (Play Store) local databases. Runs on EVERY
+        // 4. Phase 2 — Finsky (Play Store) local databases. Runs on EVERY
         //    launch, even when phase 1 was a no-op: a Finsky sync may silently
         //    wipe the forged rows, and the idempotency check re-applies them
         //    only when missing.
         val finskyOk = ensureFinskyRows(context, ourPackage)
 
-        // 4. Single summary toast.
+        // 5. Single summary toast.
+        val installerStatus = when {
+            installerOk -> "OK"
+            else -> "FAILED"
+        }
         AALogger.i(
             "Registration summary: " +
+                "installer=$installerStatus, " +
                 "phenotype=${if (phenotypeOk) "OK" else "FAILED"}, " +
                 "finsky=${if (finskyOk) "OK" else "FAILED"}"
         )
         when {
-            phenotypeOk && finskyOk ->
+            installerOk && phenotypeOk && finskyOk ->
                 showToast(context, "Petal AA: ready for Android Auto")
+            !installerOk ->
+                showToast(context, "Petal AA: installer fix failed — see logs")
             !phenotypeOk && !finskyOk ->
                 showToast(context, "Petal AA: registration failed (phenotype + finsky) — see logs")
             !phenotypeOk ->
@@ -135,6 +164,112 @@ object AASelfTweaker {
         // Copy log to /sdcard for easy retrieval
         AALogger.shareableCopy()
     }
+
+    // ---- Phase 0 — Play Store installer fix ---------------------------------
+
+    /**
+     * Phase 0 — ensures our package's installer is com.android.vending.
+     *
+     * Android Auto's CAR.VALIDATOR rejects apps whose installerPackageName is
+     * not the Play Store. When installed via Morphe Manager (or any sideload
+     * tool), the installer is the ROM's package installer, which causes the
+     * "failed all other checks" rejection.
+     *
+     * This phase:
+     *  1. Reads the current installer via PackageManager.
+     *  2. If already com.android.vending → no-op.
+     *  3. Otherwise, re-installs the APK with `pm install -r -t -i com.android.vending`,
+     *     which sets the installer to the Play Store package.
+     *
+     * The re-install kills this process immediately. On the next launch the
+     * installer is correct and the remaining phases run.
+     *
+     * Anti-loop guard: SharedPreferences track (last_spoof_installer,
+     * last_spoof_success). If the current installer matches a previous attempt
+     * that failed, we skip to avoid a restart loop. When the user re-patches
+     * (installer changes again), the guard allows a new attempt. We do NOT use
+     * versionCode because the Petal Maps versionCode is constant across our
+     * patches and would permanently block retries.
+     *
+     * Returns true when the installer is already correct or the re-install
+     * command reported success (the process will be killed right after).
+     * Returns false on any failure (caller continues with remaining phases).
+     */
+    @Suppress("DEPRECATION")
+    private fun ensurePlayStoreInstaller(context: Context, pkg: String): Boolean {
+        val pm = context.packageManager
+
+        // 1. Read current installer.
+        val currentInstaller = try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                pm.getInstallSourceInfo(pkg).installingPackageName
+            } else {
+                // Deprecated but still works on API < 30.
+                pm.getInstallerPackageName(pkg)
+            }
+        } catch (t: Throwable) {
+            AALogger.e("Could not read installer for '$pkg'", t)
+            return false
+        }
+
+        if (currentInstaller == VENDING_PACKAGE) {
+            AALogger.i("Installer already $VENDING_PACKAGE — nothing to do")
+            return true
+        }
+
+        AALogger.i("Installer is '$currentInstaller' (expected $VENDING_PACKAGE)")
+
+        // 2. Anti-loop guard: skip if we already failed with this exact installer.
+        //    Allows retry when the user re-patches (installer changes), but blocks
+        //    infinite loops when pm install keeps failing for the same installer.
+        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        val lastSpoofInstaller = prefs.getString(PREF_LAST_SPOOF_INSTALLER, null)
+        val lastSpoofSuccess = prefs.getBoolean(PREF_LAST_SPOOF_SUCCESS, false)
+        if (!lastSpoofSuccess && lastSpoofInstaller == currentInstaller) {
+            AALogger.w(
+                "Installer spoof already failed for '$currentInstaller' — " +
+                    "skipping to avoid loop"
+            )
+            return false
+        }
+
+        // 3. Obtain our own APK path from PackageManager.
+        val sourceDir = try {
+            context.applicationInfo.sourceDir
+        } catch (t: Throwable) {
+            AALogger.e("Could not read sourceDir for '$pkg'", t)
+            return false
+        }
+
+        // 5. Notify the user that the app is about to close.
+        val msg = "Petal AA: reinstalling as Play Store app — app will close; reopen it"
+        AALogger.i(msg)
+        showToast(context, msg)
+
+        // 4. Run the re-install via root. This kills our process on success.
+        val cmd = "pm install -r -t -i $VENDING_PACKAGE $sourceDir"
+        AALogger.i("Executing: $cmd")
+        val (exit, out, err) = runSu(cmd, timeoutSec = 60)
+        val success = exit == 0 && out.contains("Success", ignoreCase = true)
+
+        // Persist guard state BEFORE the process dies (on success) so the next
+        // launch knows whether to retry.
+        prefs.edit()
+            .putString(PREF_LAST_SPOOF_INSTALLER, currentInstaller)
+            .putBoolean(PREF_LAST_SPOOF_SUCCESS, success)
+            .apply()
+
+        if (success) {
+            AALogger.i("pm install succeeded — app will be restarted by the system")
+        } else {
+            AALogger.e(
+                "pm install failed (exit=$exit):\nOUT: ${out.trim()}\nERR: ${err.trim()}"
+            )
+        }
+        return success
+    }
+
+    // ---- Phase 1 — GMS phenotype allowlist ----------------------------------
 
     /**
      * Phase 1 — verifies/registers our package in the GMS phenotype
