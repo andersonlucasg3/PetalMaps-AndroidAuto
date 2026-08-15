@@ -10,7 +10,6 @@ import android.hardware.display.VirtualDisplay
 import android.os.Build
 import android.os.Bundle
 import android.util.DisplayMetrics
-import android.util.Log
 import android.view.MotionEvent
 import android.view.Surface
 import androidx.car.app.SurfaceContainer
@@ -47,8 +46,6 @@ class CarDisplay(
 ) {
 
     companion object {
-        private const val TAG = "PetalAA"
-
         /** Fully-qualified class name of the Petal Maps automotive activity. */
         const val TARGET_ACTIVITY_CLASS = "com.huawei.maps.auto.activity.AutoPetalMapsActivity"
 
@@ -127,7 +124,7 @@ class CarDisplay(
      */
     fun create(container: SurfaceContainer): Boolean {
         val surface: Surface = container.surface ?: run {
-            Log.e(TAG, "onSurfaceAvailable: surface is null — cannot create VirtualDisplay")
+            AALogger.e("onSurfaceAvailable: surface is null — cannot create VirtualDisplay")
             return false
         }
 
@@ -135,18 +132,17 @@ class CarDisplay(
         val height = container.height
         val dpi = container.dpi
 
-        Log.i(TAG, "onSurfaceAvailable: width=$width, height=$height, density=$dpi")
+        AALogger.i("onSurfaceAvailable: width=$width, height=$height, density=$dpi")
 
         // Guard: 0 / negative dimensions → bail out
         if (width <= 0 || height <= 0) {
-            Log.e(TAG, "Cannot create VirtualDisplay: invalid container dimensions ${width}x${height}")
+            AALogger.e("Cannot create VirtualDisplay: invalid container dimensions ${width}x${height}")
             return false
         }
 
         // Orientation check: expect landscape (width > height) for AutoPetalMapsActivity
         if (height > width) {
-            Log.w(
-                TAG,
+            AALogger.w(
                 "Surface reports portrait dimensions (${width}x${height}) but " +
                 "AutoPetalMapsActivity is landscape — using container values as-is"
             )
@@ -165,7 +161,7 @@ class CarDisplay(
     fun create(surface: Surface, width: Int, height: Int, density: Int): Boolean {
         // Guard: 0 / negative dimensions → bail out
         if (width <= 0 || height <= 0) {
-            Log.e(TAG, "Cannot create VirtualDisplay: invalid dimensions ${width}x${height}")
+            AALogger.e("Cannot create VirtualDisplay: invalid dimensions ${width}x${height}")
             return false
         }
 
@@ -187,13 +183,13 @@ class CarDisplay(
                 VIRTUAL_DISPLAY_FLAGS
             )
         } catch (e: Exception) {
-            Log.e(TAG, "createVirtualDisplay failed: ${e.message}", e)
+            AALogger.e("createVirtualDisplay failed: ${e.message}", e)
             return false
         }
 
         val vd = virtualDisplay ?: return false
         displayId = vd.display.displayId
-        Log.i(TAG, "VirtualDisplay created: id=$displayId, ${width}x${height}, density=$density")
+        AALogger.i("VirtualDisplay created: id=$displayId, ${width}x${height}, density=$density")
 
         // Register lifecycle callbacks BEFORE launching the activity so we
         // can catch onActivityCreated and auto-attach it.
@@ -208,17 +204,17 @@ class CarDisplay(
             }
             @Suppress("DEPRECATION")
             context.startActivity(intent, options.toBundle())
-            Log.i(TAG, "Activity launch requested on display $displayId")
+            AALogger.i("Activity launch requested on display $displayId")
         } catch (e: SecurityException) {
-            Log.e(TAG, "SecurityException launching activity on VirtualDisplay: ${e.message}", e)
+            AALogger.e("SecurityException launching activity on VirtualDisplay: ${e.message}", e)
             destroy()
             return false
         } catch (e: IllegalStateException) {
-            Log.e(TAG, "IllegalStateException launching activity on VirtualDisplay: ${e.message}", e)
+            AALogger.e("IllegalStateException launching activity on VirtualDisplay: ${e.message}", e)
             destroy()
             return false
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to launch activity on VirtualDisplay: ${e.message}", e)
+            AALogger.e("Failed to launch activity on VirtualDisplay: ${e.message}", e)
             destroy()
             return false
         }
@@ -237,9 +233,9 @@ class CarDisplay(
         if (vd != null) {
             try {
                 vd.release()
-                Log.i(TAG, "VirtualDisplay released (id=$displayId)")
+                AALogger.i("VirtualDisplay released (id=$displayId)")
             } catch (e: Exception) {
-                Log.e(TAG, "Error releasing VirtualDisplay: ${e.message}", e)
+                AALogger.e("Error releasing VirtualDisplay: ${e.message}", e)
             }
             virtualDisplay = null
         }
@@ -267,12 +263,12 @@ class CarDisplay(
                     @Suppress("DEPRECATION")
                     activity.windowManager.defaultDisplay?.displayId ?: -1
                 }
-                Log.d(TAG, "onActivityCreated: ${activity.javaClass.simpleName} on display $activityDisplayId")
+                AALogger.d("onActivityCreated: ${activity.javaClass.simpleName} on display $activityDisplayId")
 
                 if (activityDisplayId == targetId &&
                     activity.javaClass.name == targetActivityClass) {
                     projectedActivity = activity
-                    Log.i(TAG, "Activity auto-attached for touch dispatch: ${activity.javaClass.simpleName}")
+                    AALogger.i("Activity auto-attached for touch dispatch: ${activity.javaClass.simpleName}")
                 }
             }
 
@@ -280,7 +276,7 @@ class CarDisplay(
                 if (activity === projectedActivity) {
                     projectedActivity = null
                     gestureInProgress = false
-                    Log.i(TAG, "Projected activity destroyed, detached")
+                    AALogger.i("Projected activity destroyed, detached")
                 }
             }
 
@@ -293,16 +289,16 @@ class CarDisplay(
 
         app.registerActivityLifecycleCallbacks(callbacks)
         lifecycleCallbacks = callbacks
-        Log.i(TAG, "ActivityLifecycleCallbacks registered for displayId=$targetId")
+        AALogger.i("ActivityLifecycleCallbacks registered for displayId=$targetId")
     }
 
     private fun unregisterLifecycleCallbacks() {
         val callbacks = lifecycleCallbacks ?: return
         try {
             app.unregisterActivityLifecycleCallbacks(callbacks)
-            Log.d(TAG, "ActivityLifecycleCallbacks unregistered")
+            AALogger.d("ActivityLifecycleCallbacks unregistered")
         } catch (e: Exception) {
-            Log.w(TAG, "Failed to unregister lifecycle callbacks: ${e.message}")
+            AALogger.w("Failed to unregister lifecycle callbacks: ${e.message}")
         }
         lifecycleCallbacks = null
     }
@@ -540,9 +536,9 @@ class CarDisplay(
             val moveMethod: Method = autoLocClass.getMethod("moveToLocation", Int::class.javaPrimitiveType)
             moveMethod.invoke(locInstance, mode)
 
-            Log.i(TAG, "reCenter: called AutoLocationHelper.v().moveToLocation($mode)")
+            AALogger.i("reCenter: called AutoLocationHelper.v().moveToLocation($mode)")
         } catch (e: Exception) {
-            Log.w(TAG, "reCenter: reflection failed (${e.message}), falling back to center-click")
+            AALogger.w("reCenter: reflection failed (${e.message}), falling back to center-click")
             // Fallback: tap the center of the screen
             val cx = surfaceWidth / 2f
             val cy = surfaceHeight / 2f

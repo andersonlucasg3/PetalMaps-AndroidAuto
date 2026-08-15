@@ -7,7 +7,6 @@ import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.util.Base64
-import android.util.Log
 import android.widget.Toast
 import java.io.File
 import java.security.MessageDigest
@@ -45,8 +44,6 @@ import java.util.concurrent.Executors
  */
 object AASelfTweaker {
 
-    private const val TAG = "PetalAA"
-
     private const val GMS_PACKAGE = "com.google.android.gms"
     private const val GMS_CAR_PACKAGE = "com.google.android.gms.car"
     private const val GEARHEAD_PACKAGE = "com.google.android.projection.gearhead"
@@ -81,12 +78,15 @@ object AASelfTweaker {
     @JvmStatic
     fun ensureRegistered(context: Context) {
         val appContext = context.applicationContext
+        // Initialize the logger for this process
+        AALogger.init(appContext)
+        AALogger.installCrashHandler()
         executor.execute {
             try {
                 checkAndRegister(appContext)
             } catch (t: Throwable) {
                 // Never propagate: the host app must survive any failure here.
-                Log.e(TAG, "ensureRegistered: unexpected failure", t)
+                AALogger.e("ensureRegistered: unexpected failure", t)
             }
         }
     }
@@ -100,12 +100,12 @@ object AASelfTweaker {
         //    (e.g. com.android.vending) from plain `su`.
         val rooted = detectSuArgs()
         if (!rooted) {
-            Log.w(TAG, "Root not available — skipping")
+            AALogger.w("Root not available — skipping")
             return
         }
 
         val ourPackage = context.packageName
-        Log.i(TAG, "Root OK. Ensuring Android Auto registration for '$ourPackage'")
+        AALogger.i("Root OK. Ensuring Android Auto registration for '$ourPackage'")
 
         // 2. Phase 1 — GMS phenotype allowlist.
         val phenotypeOk = ensurePhenotypeOverrides(context, ourPackage)
@@ -117,8 +117,8 @@ object AASelfTweaker {
         val finskyOk = ensureFinskyRows(context, ourPackage)
 
         // 4. Single summary toast.
-        Log.i(
-            TAG, "Registration summary: " +
+        AALogger.i(
+            "Registration summary: " +
                 "phenotype=${if (phenotypeOk) "OK" else "FAILED"}, " +
                 "finsky=${if (finskyOk) "OK" else "FAILED"}"
         )
@@ -132,6 +132,8 @@ object AASelfTweaker {
             else ->
                 showToast(context, "Petal AA: finsky forge failed — see logs")
         }
+        // Copy log to /sdcard for easy retrieval
+        AALogger.shareableCopy()
     }
 
     /**
@@ -147,7 +149,7 @@ object AASelfTweaker {
         val (statExit, statOut, _) = runSu("stat -c '%u %g' $PHENOTYPE_DB_PATH")
         val ownerIds = statOut.trim().split(Regex("\\s+"))
         if (statExit != 0 || ownerIds.size < 2) {
-            Log.w(TAG, "Could not stat phenotype.db (exit=$statExit, out='$statOut') — skipping")
+            AALogger.w("Could not stat phenotype.db (exit=$statExit, out='$statOut') — skipping")
             return false
         }
         val uid = ownerIds[0]
@@ -156,7 +158,7 @@ object AASelfTweaker {
         // 3. Copy the db (plus WAL/SHM if present) into our private dir.
         val workDb = File(context.filesDir, WORK_DB_NAME)
         if (!copyDbToWorkDir(workDb)) {
-            Log.w(TAG, "Failed to copy phenotype.db to work dir — skipping")
+            AALogger.w("Failed to copy phenotype.db to work dir — skipping")
             return false
         }
 
@@ -171,25 +173,25 @@ object AASelfTweaker {
                 val hasLegacySchema = tableExists(db, "FlagOverrides")
                 when {
                     hasNewSchema -> {
-                        Log.i(TAG, "New phenotype schema detected (flag_overrides)")
+                        AALogger.i("New phenotype schema detected (flag_overrides)")
                         if (isPackageWhitelistedNewSchema(db, ourPackage)) {
-                            Log.i(TAG, "'$ourPackage' already in $FLAG_APP_WHITE_LIST — nothing to do")
+                            AALogger.i("'$ourPackage' already in $FLAG_APP_WHITE_LIST — nothing to do")
                             return true
                         }
-                        Log.i(TAG, "'$ourPackage' missing from allowlist — registering (new schema)")
+                        AALogger.i("'$ourPackage' missing from allowlist — registering (new schema)")
                         applyNewSchemaOverrides(db, ourPackage)
                     }
                     hasLegacySchema -> {
-                        Log.i(TAG, "Legacy phenotype schema detected (FlagOverrides)")
+                        AALogger.i("Legacy phenotype schema detected (FlagOverrides)")
                         if (isPackageWhitelisted(db, ourPackage)) {
-                            Log.i(TAG, "'$ourPackage' already in $FLAG_APP_WHITE_LIST — nothing to do")
+                            AALogger.i("'$ourPackage' already in $FLAG_APP_WHITE_LIST — nothing to do")
                             return true
                         }
-                        Log.i(TAG, "'$ourPackage' missing from allowlist — registering (legacy schema)")
+                        AALogger.i("'$ourPackage' missing from allowlist — registering (legacy schema)")
                         applyFlagOverrides(db, ourPackage)
                     }
                     else -> {
-                        Log.w(TAG, "No known overrides table (flag_overrides / FlagOverrides) " +
+                        AALogger.w("No known overrides table (flag_overrides / FlagOverrides) " +
                                 "— unsupported GMS schema, skipping")
                         return false
                     }
@@ -205,16 +207,16 @@ object AASelfTweaker {
             // 6. Push the patched copy back over the original.
             val (cpExit, _, cpErr) = runSu("cp ${workDb.absolutePath} $PHENOTYPE_DB_PATH")
             if (cpExit != 0) {
-                Log.e(TAG, "Failed to copy patched db back: $cpErr")
+                AALogger.e("Failed to copy patched db back: $cpErr")
                 return false
             }
-            Log.i(TAG, "Patched db copied back to $PHENOTYPE_DB_PATH")
+            AALogger.i("Patched db copied back to $PHENOTYPE_DB_PATH")
 
             // 6b. Drop stale WAL/SHM at the destination so GMS cannot replay an
             //     old journal over the patched db.
             val (rmExit, _, rmErr) = runSu("rm -f $PHENOTYPE_DB_PATH-wal $PHENOTYPE_DB_PATH-shm")
             if (rmExit != 0) {
-                Log.w(TAG, "rm of stale -wal/-shm failed (exit=$rmExit): $rmErr")
+                AALogger.w("rm of stale -wal/-shm failed (exit=$rmExit): $rmErr")
             }
 
             // 7. Restore ownership and SELinux context so GMS can open the db.
@@ -222,7 +224,7 @@ object AASelfTweaker {
             val (rcExit, _, rcErr) = runSu("restorecon $PHENOTYPE_DB_PATH")
             if (rcExit != 0) {
                 // restorecon may not exist on some ROMs — not fatal.
-                Log.d(TAG, "restorecon failed/absent (exit=$rcExit): $rcErr")
+                AALogger.d("restorecon failed/absent (exit=$rcExit): $rcErr")
             }
 
             // 8. Restart Android Auto so it re-reads the flags.
@@ -230,13 +232,13 @@ object AASelfTweaker {
 
             success = true
         } catch (t: Throwable) {
-            Log.e(TAG, "Phenotype registration flow failed", t)
+            AALogger.e("Phenotype registration flow failed", t)
         } finally {
             deleteWorkDb(workDb)
         }
 
         if (success) {
-            Log.i(TAG, "Registered '$ourPackage' in Android Auto allowlist (phenotype)")
+            AALogger.i("Registered '$ourPackage' in Android Auto allowlist (phenotype)")
         }
         return success
     }
@@ -258,15 +260,15 @@ object AASelfTweaker {
      * false on any failure.
      */
     private fun ensureFinskyRows(context: Context, pkg: String): Boolean {
-        Log.i(TAG, "Finsky forge: checking rows for '$pkg'")
+        AALogger.i("Finsky forge: checking rows for '$pkg'")
 
         // 1. Compute the certificate hash first — no root needed.
         val hash = getCertificateHash(context)
         if (hash == null) {
-            Log.e(TAG, "Finsky forge: signing certificate hash unavailable — skipping")
+            AALogger.e("Finsky forge: signing certificate hash unavailable — skipping")
             return false
         }
-        Log.i(TAG, "Finsky forge: certificate hash='$hash'")
+        AALogger.i("Finsky forge: certificate hash='$hash'")
 
         // 2. Stop vending so it does not rewrite the dbs while we work on them.
         runSu("am force-stop $VENDING_PACKAGE")
@@ -293,11 +295,11 @@ object AASelfTweaker {
             }
         }
         if (owner.isEmpty()) {
-            Log.w(TAG, "Finsky forge: could not determine vending owner " +
+            AALogger.w("Finsky forge: could not determine vending owner " +
                     "(ls exit=$lsExit, out='${lsOut.trim()}') — skipping")
             return false
         }
-        Log.i(TAG, "Finsky forge: vending data owner=$owner")
+        AALogger.i("Finsky forge: vending data owner=$owner")
 
         // 4. Copy both dbs (plus WAL/SHM when present) into our private dir.
         val workAppState = File(context.filesDir, WORK_APPSTATE_DB_NAME)
@@ -318,7 +320,7 @@ object AASelfTweaker {
             )
             try {
                 if (!tableExists(appStateDb, "appstate")) {
-                    Log.w(TAG, "Finsky forge: 'appstate' table missing — unsupported schema")
+                    AALogger.w("Finsky forge: 'appstate' table missing — unsupported schema")
                     return false
                 }
                 if (rowExists(
@@ -326,7 +328,7 @@ object AASelfTweaker {
                         "SELECT 1 FROM appstate WHERE package_name=?", arrayOf(pkg)
                     )
                 ) {
-                    Log.i(TAG, "Finsky forge: appstate row for '$pkg' already present")
+                    AALogger.i("Finsky forge: appstate row for '$pkg' already present")
                 } else {
                     insertAppStateRow(appStateDb, pkg)
                     appStateDirty = true
@@ -343,7 +345,7 @@ object AASelfTweaker {
             )
             try {
                 if (!tableExists(libraryDb, "ownership")) {
-                    Log.w(TAG, "Finsky forge: 'ownership' table missing — unsupported schema")
+                    AALogger.w("Finsky forge: 'ownership' table missing — unsupported schema")
                     return false
                 }
                 if (rowExists(
@@ -352,7 +354,7 @@ object AASelfTweaker {
                         arrayOf(pkg, hash)
                     )
                 ) {
-                    Log.i(TAG, "Finsky forge: ownership row with our hash already present")
+                    AALogger.i("Finsky forge: ownership row with our hash already present")
                 } else {
                     insertOwnershipRows(libraryDb, pkg, hash)
                     libraryDirty = true
@@ -363,7 +365,7 @@ object AASelfTweaker {
             }
 
             if (!appStateDirty && !libraryDirty) {
-                Log.i(TAG, "Finsky forge: all rows already in place — nothing written")
+                AALogger.i("Finsky forge: all rows already in place — nothing written")
                 return true
             }
 
@@ -378,13 +380,13 @@ object AASelfTweaker {
             runSu("am force-stop $VENDING_PACKAGE")
             runSu("am force-stop $GEARHEAD_PACKAGE")
 
-            Log.i(
-                TAG, "Finsky forge: rows forged for '$pkg' " +
+            AALogger.i(
+                "Finsky forge: rows forged for '$pkg' " +
                     "(appState written=$appStateDirty, ownership written=$libraryDirty)"
             )
             return true
         } catch (t: Throwable) {
-            Log.e(TAG, "Finsky forge failed", t)
+            AALogger.e("Finsky forge failed", t)
             return false
         } finally {
             deleteWorkDb(workAppState)
@@ -408,7 +410,7 @@ object AASelfTweaker {
                 pm.getPackageInfo(context.packageName, PackageManager.GET_SIGNATURES)
                     .signatures?.firstOrNull()
             } ?: run {
-                Log.e(TAG, "No signing certificate found for '${context.packageName}'")
+                AALogger.e("No signing certificate found for '${context.packageName}'")
                 return null
             }
             val cert = CertificateFactory.getInstance("X.509")
@@ -416,7 +418,7 @@ object AASelfTweaker {
             val sha1 = MessageDigest.getInstance("SHA-1").digest(cert.encoded)
             Base64.encodeToString(sha1, Base64.URL_SAFE or Base64.NO_PADDING or Base64.NO_WRAP)
         } catch (t: Throwable) {
-            Log.e(TAG, "getCertificateHash failed", t)
+            AALogger.e("getCertificateHash failed", t)
             null
         }
     }
@@ -424,7 +426,7 @@ object AASelfTweaker {
     /** INSERT OR REPLACE the single appstate row mirroring a Play-installed app. */
     private fun insertAppStateRow(db: SQLiteDatabase, pkg: String) {
         val now = System.currentTimeMillis()
-        Log.i(TAG, "Finsky forge: INSERT appstate package_name='$pkg' first_download_ms=$now")
+        AALogger.i("Finsky forge: INSERT appstate package_name='$pkg' first_download_ms=$now")
         db.execSQL(
             "INSERT OR REPLACE INTO appstate(" +
                 "package_name,account,first_download_ms,persistent_flags," +
@@ -443,7 +445,7 @@ object AASelfTweaker {
      */
     private fun insertOwnershipRows(db: SQLiteDatabase, pkg: String, hash: String) {
         val now = System.currentTimeMillis()
-        Log.i(TAG, "Finsky forge: INSERT ownership doc_id='$pkg' library_id='u-tpl' hash=''")
+        AALogger.i("Finsky forge: INSERT ownership doc_id='$pkg' library_id='u-tpl' hash=''")
         db.execSQL(
             "INSERT OR REPLACE INTO ownership(" +
                 "library_id,backend,account,doc_id,doc_type," +
@@ -451,7 +453,7 @@ object AASelfTweaker {
                 ") VALUES ('u-tpl',0,'',?,1,'',2,?)",
             arrayOf<Any>(pkg, now)
         )
-        Log.i(TAG, "Finsky forge: INSERT ownership doc_id='$pkg' library_id='3' hash='$hash'")
+        AALogger.i("Finsky forge: INSERT ownership doc_id='$pkg' library_id='3' hash='$hash'")
         db.execSQL(
             "INSERT OR REPLACE INTO ownership(" +
                 "library_id,backend,account,doc_id,doc_type," +
@@ -484,8 +486,8 @@ object AASelfTweaker {
         val ok = workAppState.canRead() && workAppState.canWrite() &&
             workLibrary.canRead() && workLibrary.canWrite()
         if (!ok) {
-            Log.e(
-                TAG, "Finsky forge: db copies not usable " +
+            AALogger.e(
+                "Finsky forge: db copies not usable " +
                     "(exit=$exit, out='${out.trim()}', err='${err.trim()}')"
             )
             return false
@@ -518,10 +520,10 @@ object AASelfTweaker {
             "; restorecon $LOCAL_APP_STATE_DB_PATH $LIBRARY_DB_PATH 2>/dev/null || true"
         val (exit, _, err) = runSu(cmd)
         if (exit != 0) {
-            Log.e(TAG, "Finsky forge: failed to copy patched dbs back (exit=$exit): ${err.trim()}")
+            AALogger.e("Finsky forge: failed to copy patched dbs back (exit=$exit): ${err.trim()}")
             return false
         }
-        Log.i(TAG, "Finsky forge: patched dbs restored")
+        AALogger.i("Finsky forge: patched dbs restored")
         return true
     }
 
@@ -530,7 +532,7 @@ object AASelfTweaker {
         return runCatching {
             db.rawQuery(sql, args).use { it.moveToFirst() }
         }.getOrElse {
-            Log.w(TAG, "Query failed: $sql", it)
+            AALogger.e("Query failed: $sql", it)
             false
         }
     }
@@ -555,7 +557,7 @@ object AASelfTweaker {
     private fun copyDbToWorkDir(workDb: File): Boolean {
         val (cpExit, _, cpErr) = runSu("cp $PHENOTYPE_DB_PATH ${workDb.absolutePath}")
         if (cpExit != 0) {
-            Log.e(TAG, "cp of phenotype.db failed: $cpErr")
+            AALogger.e("cp of phenotype.db failed: $cpErr")
             return false
         }
         // WAL/SHM companions are optional; ignore failures.
@@ -575,7 +577,7 @@ object AASelfTweaker {
     /** True when [pkg] already appears in the `app_white_list` override. */
     private fun isPackageWhitelisted(db: SQLiteDatabase, pkg: String): Boolean {
         val current = readOverrideValue(db, GMS_CAR_PACKAGE, FLAG_APP_WHITE_LIST) ?: return false
-        Log.i(TAG, "Current $FLAG_APP_WHITE_LIST value: '$current'")
+        AALogger.i("Current $FLAG_APP_WHITE_LIST value: '$current'")
         return current.split(',').any { it.trim() == pkg }
     }
 
@@ -588,7 +590,7 @@ object AASelfTweaker {
                 if (cursor.moveToFirst() && !cursor.isNull(0)) cursor.getString(0) else null
             }
         }.getOrElse {
-            Log.w(TAG, "Could not read override '$name'", it)
+            AALogger.e("Could not read override '$name'", it)
             null
         }
     }
@@ -613,16 +615,16 @@ object AASelfTweaker {
                     val name = cursor.getString(1)
                     if (firstId == null) firstId = id
                     if (name == packagePrefix) {
-                        Log.i(TAG, "Resolved config_package_id=$id for exact match '$name'")
+                        AALogger.i("Resolved config_package_id=$id for exact match '$name'")
                         return@use id
                     }
                 }
                 firstId?.also {
-                    Log.i(TAG, "Resolved config_package_id=$it for prefix '$packagePrefix%'")
+                    AALogger.i("Resolved config_package_id=$it for prefix '$packagePrefix%'")
                 }
             }
         }.getOrElse {
-            Log.w(TAG, "Failed to resolve config_package_id for '$packagePrefix'", it)
+            AALogger.e("Failed to resolve config_package_id for '$packagePrefix'", it)
             null
         }
     }
@@ -640,7 +642,7 @@ object AASelfTweaker {
                 if (cursor.moveToFirst() && !cursor.isNull(0)) cursor.getString(0) else null
             }
         }.getOrElse {
-            Log.w(TAG, "Could not read new-schema override '$name'", it)
+            AALogger.e("Could not read new-schema override '$name'", it)
             null
         }
     }
@@ -648,11 +650,11 @@ object AASelfTweaker {
     /** True when [pkg] already appears in `app_white_list` (new schema). */
     private fun isPackageWhitelistedNewSchema(db: SQLiteDatabase, pkg: String): Boolean {
         val gmsCarId = resolveConfigPackageId(db, GMS_CAR_PACKAGE) ?: run {
-            Log.w(TAG, "config_packages has no entry for '$GMS_CAR_PACKAGE' — cannot verify")
+            AALogger.w("config_packages has no entry for '$GMS_CAR_PACKAGE' — cannot verify")
             return false
         }
         val current = readNewOverrideValue(db, gmsCarId, FLAG_APP_WHITE_LIST) ?: return false
-        Log.i(TAG, "Current $FLAG_APP_WHITE_LIST value: '$current'")
+        AALogger.i("Current $FLAG_APP_WHITE_LIST value: '$current'")
         return current.split(',').any { it.trim() == pkg }
     }
 
@@ -660,7 +662,7 @@ object AASelfTweaker {
     private fun putNewOverride(
         db: SQLiteDatabase, configPackageId: Long, name: String, value: String, type: Int
     ) {
-        Log.i(TAG, "INSERT flag_overrides: config_package_id=$configPackageId " +
+        AALogger.i("INSERT flag_overrides: config_package_id=$configPackageId " +
                 "name='$name' value='$value' type=$type")
         db.execSQL(
             "INSERT OR REPLACE INTO flag_overrides " +
@@ -679,7 +681,7 @@ object AASelfTweaker {
         val gmsCarId = resolveConfigPackageId(db, GMS_CAR_PACKAGE)
         val gearheadId = resolveConfigPackageId(db, GEARHEAD_PACKAGE)
         if (gmsCarId == null && gearheadId == null) {
-            Log.w(TAG, "Could not resolve any config_package_id — nothing written")
+            AALogger.w("Could not resolve any config_package_id — nothing written")
             return
         }
 
@@ -699,7 +701,7 @@ object AASelfTweaker {
                 "0", TYPE_BOOL
             )
         } else {
-            Log.w(TAG, "No config_package_id for '$GMS_CAR_PACKAGE' — gms.car flags skipped")
+            AALogger.w("No config_package_id for '$GMS_CAR_PACKAGE' — gms.car flags skipped")
         }
 
         if (gearheadId != null) {
@@ -709,15 +711,15 @@ object AASelfTweaker {
             putNewOverride(db, gearheadId, "AppValidation__blocked_packages_by_installer", "", TYPE_STRING)
             putNewOverride(db, gearheadId, "UnknownSources__allow_full_screen_apps", "1", TYPE_BOOL)
         } else {
-            Log.w(TAG, "No config_package_id for '$GEARHEAD_PACKAGE' — gearhead flags skipped")
+            AALogger.w("No config_package_id for '$GEARHEAD_PACKAGE' — gearhead flags skipped")
         }
 
         // Best effort: the Flags table may not exist in the new schema.
         runCatching {
             db.execSQL("DELETE FROM Flags WHERE name='app_black_list'")
-            Log.i(TAG, "DELETE FROM Flags WHERE name='app_black_list' executed")
+            AALogger.i("DELETE FROM Flags WHERE name='app_black_list' executed")
         }.onFailure {
-            Log.d(TAG, "DELETE FROM Flags skipped (table absent?): ${it.message}")
+            AALogger.d("DELETE FROM Flags skipped (table absent?): ${it.message}")
         }
     }
 
@@ -738,7 +740,7 @@ object AASelfTweaker {
      */
     private fun applyFlagOverrides(db: SQLiteDatabase, pkg: String) {
         runCatching { db.execSQL("DROP TRIGGER IF EXISTS aa_patched_apps") }
-            .onFailure { Log.d(TAG, "DROP TRIGGER aa_patched_apps skipped: ${it.message}") }
+            .onFailure { AALogger.d("DROP TRIGGER aa_patched_apps skipped: ${it.message}") }
 
         // Merged CSV overrides — preserve entries from other apps.
         val mergedWhiteList = mergeCsv(
@@ -748,13 +750,13 @@ object AASelfTweaker {
             readOverrideValue(db, GMS_CAR_PACKAGE, FLAG_BROADCAST_WHITELIST), pkg
         )
 
-        Log.i(TAG, "INSERT FlagOverrides: name='$FLAG_APP_WHITE_LIST' stringVal='$mergedWhiteList'")
+        AALogger.i("INSERT FlagOverrides: name='$FLAG_APP_WHITE_LIST' stringVal='$mergedWhiteList'")
         db.execSQL(
             "INSERT OR REPLACE INTO FlagOverrides " +
                 "(packageName,flagType,name,user,stringVal,committed) VALUES (?,0,?,?,?,0)",
             arrayOf(GMS_CAR_PACKAGE, FLAG_APP_WHITE_LIST, "", mergedWhiteList)
         )
-        Log.i(TAG, "INSERT FlagOverrides: name='$FLAG_BROADCAST_WHITELIST' stringVal='$mergedBroadcast'")
+        AALogger.i("INSERT FlagOverrides: name='$FLAG_BROADCAST_WHITELIST' stringVal='$mergedBroadcast'")
         db.execSQL(
             "INSERT OR REPLACE INTO FlagOverrides " +
                 "(packageName,flagType,name,user,stringVal,committed) VALUES (?,0,?,?,?,0)",
@@ -767,7 +769,7 @@ object AASelfTweaker {
             GEARHEAD_PACKAGE to "AppValidation__blocked_packages_by_installer"
         )
         for ((owner, name) in emptyStringRows) {
-            Log.i(TAG, "INSERT FlagOverrides: package='$owner' name='$name' stringVal=''")
+            AALogger.i("INSERT FlagOverrides: package='$owner' name='$name' stringVal=''")
             db.execSQL(
                 "INSERT OR REPLACE INTO FlagOverrides " +
                     "(packageName,flagType,name,user,stringVal,committed) VALUES (?,0,?,'','',0)",
@@ -788,7 +790,7 @@ object AASelfTweaker {
             Triple(GEARHEAD_PACKAGE, "UnknownSources__allow_full_screen_apps", 1)
         )
         for ((owner, name, value) in boolRows) {
-            Log.i(TAG, "INSERT FlagOverrides: package='$owner' name='$name' boolVal=$value")
+            AALogger.i("INSERT FlagOverrides: package='$owner' name='$name' boolVal=$value")
             db.execSQL(
                 "INSERT OR REPLACE INTO FlagOverrides " +
                     "(packageName,flagType,name,user,boolVal,committed) VALUES (?,0,?,'',?,0)",
@@ -798,9 +800,9 @@ object AASelfTweaker {
 
         runCatching {
             db.execSQL("DELETE FROM Flags WHERE name='app_black_list'")
-            Log.i(TAG, "DELETE FROM Flags WHERE name='app_black_list' executed")
+            AALogger.i("DELETE FROM Flags WHERE name='app_black_list' executed")
         }.onFailure {
-            Log.d(TAG, "DELETE FROM Flags skipped (table absent?): ${it.message}")
+            AALogger.d("DELETE FROM Flags skipped (table absent?): ${it.message}")
         }
     }
 
@@ -831,7 +833,7 @@ object AASelfTweaker {
             }.getOrNull() ?: continue
             if (out.contains("uid=0")) {
                 suArgs = args
-                Log.i(TAG, "Root OK via: ${args.joinToString(" ")}")
+                AALogger.i("Root OK via: ${args.joinToString(" ")}")
                 return true
             }
         }
@@ -871,13 +873,13 @@ object AASelfTweaker {
             errThread.join(1000)
             if (exitCode == null) {
                 process.destroy()
-                Log.w(TAG, "su command timed out after ${timeoutSec}s: $command")
+                AALogger.w("su command timed out after ${timeoutSec}s: $command")
                 Triple(-1, stdout, stderr)
             } else {
                 Triple(exitCode, stdout, stderr)
             }
         } catch (t: Throwable) {
-            Log.e(TAG, "runSu failed for: $command", t)
+            AALogger.e("runSu failed for: $command", t)
             Triple(-1, "", t.message ?: "")
         }
     }

@@ -1,7 +1,7 @@
 {
-    "version": "1.1.10",
-    "created_at": "2026-08-07T22:50:53",
-    "description": "Fix car projection: create the VirtualDisplay from the SurfaceContainer dimensions/dpi (was using the phone's displayMetrics — could create an invalid display). Adds PetalAA log markers across the whole car flow (session, template, surface, display, launch, resize) and logs launch exceptions.\n\n- **Android Auto**: injects PetalCarAppService and projects the built-in HiCar automotive UI (AutoPetalMapsActivity) onto the head-unit surface via VirtualDisplay, with synthetic pan/zoom/recenter gestures.\n- **Anti-Repack Bypass**: neutralises the native SecurityDetect.irpj() integrity check that kills the process on re-signed APKs.\n- **Manufacturer Check Bypass**: removes the Huawei/Honor-only device gate.\n- **Change package name**: install alongside the original app (default: morphe.huawei.petal.maps).",
-    "download_url": "https://github.com/andersonlucasg3/PetalMaps-AndroidAuto/releases/download/v1.1.10/patches-1.1.10.mpp",
+    "version": "1.1.11",
+    "created_at": "2026-08-15T01:45:39",
+    "description": "Remote diagnostics: AALogger writes all extension logs to /sdcard/petal_aa.log (shareable without adb), captures fatal crashes (=== FATAL CRASH === marker) before delegating to the original handler, and copies the log when the car session ends.\n\n- **Android Auto**: injects PetalCarAppService and projects the built-in HiCar automotive UI (AutoPetalMapsActivity) onto the head-unit surface via VirtualDisplay, with synthetic pan/zoom/recenter gestures.\n- **Anti-Repack Bypass**: neutralises the native SecurityDetect.irpj() integrity check that kills the process on re-signed APKs.\n- **Manufacturer Check Bypass**: removes the Huawei/Honor-only device gate.\n- **Change package name**: install alongside the original app (default: morphe.huawei.petal.maps).",
+    "download_url": "https://github.com/andersonlucasg3/PetalMaps-AndroidAuto/releases/download/v1.1.11/patches-1.1.11.mpp",
     "signature_download_url": ""
 }
