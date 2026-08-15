@@ -1,7 +1,7 @@
 {
-    "version": "1.1.14",
-    "created_at": "2026-08-15T11:07:44",
-    "description": "Fix ANR on the car: add car-app-api.level to the APK root (androidx.car.app reads it via ClassLoader; without it getAppInfo() threw and the host reported ANR). Also: tweaker now warms up Play Store automatically (deviceidle whitelist + starts PlayGearheadService) — no need to open the Play Store manually.\n\n- **Android Auto**: injects PetalCarAppService and projects the built-in HiCar automotive UI (AutoPetalMapsActivity) onto the head-unit surface via VirtualDisplay, with synthetic pan/zoom/recenter gestures.\n- **Anti-Repack Bypass**: neutralises the native SecurityDetect.irpj() integrity check that kills the process on re-signed APKs.\n- **Manufacturer Check Bypass**: removes the Huawei/Honor-only device gate.\n- **Change package name**: install alongside the original app (default: morphe.huawei.petal.maps).",
-    "download_url": "https://github.com/andersonlucasg3/PetalMaps-AndroidAuto/releases/download/v1.1.14/patches-1.1.14.mpp",
+    "version": "1.1.15",
+    "created_at": "2026-08-15T11:32:31",
+    "description": "Add androidx.car.app.ACCESS_SURFACE permission — the car host throws SecurityException when the app registers its SurfaceCallback without it (crashed PetalSession.onCreateScreen).\n\n- **Android Auto**: injects PetalCarAppService and projects the built-in HiCar automotive UI (AutoPetalMapsActivity) onto the head-unit surface via VirtualDisplay, with synthetic pan/zoom/recenter gestures.\n- **Anti-Repack Bypass**: neutralises the native SecurityDetect.irpj() integrity check that kills the process on re-signed APKs.\n- **Manufacturer Check Bypass**: removes the Huawei/Honor-only device gate.\n- **Change package name**: install alongside the original app (default: morphe.huawei.petal.maps).",
+    "download_url": "https://github.com/andersonlucasg3/PetalMaps-AndroidAuto/releases/download/v1.1.15/patches-1.1.15.mpp",
     "signature_download_url": ""
 }
