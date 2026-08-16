@@ -1,6 +1,7 @@
 package dev.petalaa.extension
 
 import android.app.Activity
+import android.app.ActivityManager
 import android.app.Application
 import android.content.Context
 import android.content.Intent
@@ -97,6 +98,9 @@ class CarDisplay(
 
     /** Whether a gesture stream is in progress (DOWN already sent). */
     private var gestureInProgress: Boolean = false
+
+    /** Whether the scroll anchor (live window center) has been logged once. */
+    private var scrollAnchorLogged: Boolean = false
 
     /** Cached Application reference for lifecycle callbacks registration. */
     private val app: Application =
@@ -246,6 +250,11 @@ class CarDisplay(
             return true
         }
 
+        // A previous creation may leave a task with stale (portrait/
+        // letterboxed) bounds that am start would inherit — remove it so
+        // the relaunch starts fresh (best-effort).
+        removeStaleTask()
+
         // Launch the activity on the virtual display via `am start` as root.
         // Ordinary apps cannot use ActivityOptions.setLaunchDisplayId on a
         // VirtualDisplay they own (SecurityException: Permission Denial).
@@ -256,7 +265,10 @@ class CarDisplay(
         // MULTIPLE_TASK was removed: each relaunch used to spawn a NEW task,
         // leaving orphan windows with inherited/letterboxed bounds.
         val flagsDecimal = 0x10000000 or 0x00002000 // 268443648
-        val amCmd = "am start -n $componentName --display $displayId -f $flagsDecimal"
+        // --windowingMode 1 = WINDOWING_MODE_FULLSCREEN: force the window
+        // into fullscreen bounds on the display instead of inheriting stale
+        // bounds from a reused task.
+        val amCmd = "am start -n $componentName --display $displayId -f $flagsDecimal --windowingMode 1"
         AALogger.i("CarDisplay: launching via root: $amCmd")
 
         val (exitCode, stdout, stderr) = RootShell.run(amCmd, timeoutSec = 15)
@@ -289,6 +301,9 @@ class CarDisplay(
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                     options.launchDisplayId = displayId
                 }
+                // Note: ActivityOptions.setLaunchWindowingMode is @hide —
+                // not exposed to apps. The fullscreen windowing mode is
+                // only applied via `--windowingMode 1` in the am command.
                 @Suppress("DEPRECATION")
                 context.startActivity(intent, options.toBundle())
                 AALogger.i("CarDisplay: fallback startActivity succeeded")
@@ -345,6 +360,7 @@ class CarDisplay(
         }
         displayId = -1
         gestureInProgress = false
+        scrollAnchorLogged = false
     }
 
     /**
@@ -352,6 +368,64 @@ class CarDisplay(
      * Used to detect whether a resize is needed.
      */
     fun currentDimensions(): Pair<Int, Int> = surfaceWidth to surfaceHeight
+
+    // ---- task cleanup / window bounds -------------------------------------
+
+    /**
+     * Best-effort removal of any pre-existing task for the target activity.
+     *
+     * A previous creation may leave a task whose window bounds are stale
+     * (e.g. portrait/letterboxed). `am start` would reuse that task and
+     * inherit its bounds, so we remove it before relaunching.
+     *
+     * Uses [ActivityManager.getAppTasks]: the task belongs to our own UID
+     * (we run inside the Petal Maps process), so no permission is needed.
+     * Deprecated since API 29 but still functional for own-app tasks.
+     * Identifying the task's base component requires `AppTask.getTaskInfo`
+     * (API 29+); on older APIs we can't identify it and skip removal.
+     */
+    private fun removeStaleTask() {
+        try {
+            val am = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+            @Suppress("DEPRECATION")
+            val tasks = am.appTasks
+            if (tasks.isNullOrEmpty()) return
+            for (task in tasks) {
+                val baseClass = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    task.taskInfo?.baseActivity?.className
+                } else null
+                if (baseClass == targetActivityClass) {
+                    AALogger.w(
+                        "CarDisplay: removing stale task for $targetActivityClass " +
+                            "(would inherit old window bounds)"
+                    )
+                    task.finishAndRemoveTask()
+                }
+            }
+        } catch (e: Exception) {
+            AALogger.w("CarDisplay: removeStaleTask failed: ${e.message}")
+        }
+    }
+
+    /**
+     * Logs the live window bounds in display space as
+     * `[left, top, right, bottom] (WxH)`. Best-effort: at attach time the
+     * window may not be fully laid out yet, so values can be provisional.
+     */
+    private fun logWindowBounds(activity: Activity, tag: String) {
+        try {
+            val decor = activity.window?.decorView ?: return
+            val loc = IntArray(2)
+            decor.getLocationOnScreen(loc)
+            AALogger.i(
+                "CarDisplay: $tag window bounds=[${loc[0]},${loc[1]}," +
+                    "${loc[0] + decor.width},${loc[1] + decor.height}] " +
+                    "(${decor.width}x${decor.height})"
+            )
+        } catch (e: Exception) {
+            AALogger.w("CarDisplay: failed to read window bounds ($tag): ${e.message}")
+        }
+    }
 
     // ---- Activity lifecycle detection ------------------------------------
 
@@ -375,6 +449,7 @@ class CarDisplay(
                     activity.javaClass.name == targetActivityClass) {
                     projectedActivity = activity
                     AALogger.i("Activity auto-attached for touch dispatch: ${activity.javaClass.simpleName} on display $activityDisplayId")
+                    logWindowBounds(activity, "launch")
                     AALogger.shareableCopy()
                 }
             }
@@ -667,11 +742,43 @@ class CarDisplay(
     // -- gesture stream helpers --------------------------------------------
 
     /**
-     * If no gesture stream is active, emit ACTION_DOWN at the last known
-     * touch position to start one.
+     * If no gesture stream is active, emit ACTION_DOWN to start one.
+     *
+     * The anchor is the **center of the live window in display space**,
+     * not the last click position: the host sends only deltas for
+     * scroll/fling, and `lastTouchX/Y` may be stale or lie outside the
+     * (offset) window — the initial DOWN would then land off-window and
+     * the map never drags.
+     *
+     * The center is `getLocationOnScreen` + half the decor size, which is
+     * already display space (window → display is the inverse of the
+     * dispatch transform; the rectangle center is invariant under the
+     * window rotation), so the dispatch transform still applies exactly
+     * once — it is NOT applied here.
      */
     private fun ensureGestureDown() {
         if (gestureInProgress) return
+
+        val activity = projectedActivity
+        val decor = activity?.window?.decorView
+        if (decor != null) {
+            val loc = IntArray(2)
+            decor.getLocationOnScreen(loc)
+            lastTouchX = (loc[0] + decor.width / 2).toFloat()
+            lastTouchY = (loc[1] + decor.height / 2).toFloat()
+
+            // Log bounds + anchor once per display lifecycle (first scroll),
+            // not per event — MOVE events would spam the log.
+            if (!scrollAnchorLogged) {
+                scrollAnchorLogged = true
+                AALogger.i(
+                    "CarDisplay: scroll anchor at window center=($lastTouchX,$lastTouchY) " +
+                        "bounds=[${loc[0]},${loc[1]},${loc[0] + decor.width},${loc[1] + decor.height}] " +
+                        "(${decor.width}x${decor.height})"
+                )
+            }
+        }
+
         val now = System.currentTimeMillis()
         val down = MotionEvent.obtain(
             now, now, MotionEvent.ACTION_DOWN, lastTouchX, lastTouchY, 0
