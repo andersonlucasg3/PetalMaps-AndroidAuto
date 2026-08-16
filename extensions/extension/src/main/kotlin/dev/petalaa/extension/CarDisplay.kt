@@ -4,13 +4,16 @@ import android.app.Activity
 import android.app.Application
 import android.content.Context
 import android.content.Intent
+import android.graphics.Matrix
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
 import android.os.Build
 import android.os.Bundle
 import android.util.DisplayMetrics
+import android.view.Display
 import android.view.MotionEvent
 import android.view.Surface
+import android.view.View
 import androidx.car.app.SurfaceContainer
 import java.lang.reflect.Method
 
@@ -412,6 +415,26 @@ class CarDisplay(
     /**
      * Low-level dispatch — sends [event] to the projected activity's decor
      * view. Silently dropped if the activity hasn't been attached yet.
+     *
+     * ## Coordinate transform
+     *
+     * The host sends touch coordinates in **display space**, but
+     * `View.dispatchTouchEvent` expects **window-local** coordinates. The
+     * window can be offset on the display (e.g. letterboxing) and/or
+     * rotated (`Display.getRotation()` != 0), so before dispatch every
+     * pointer is mapped with an affine transform (via [Matrix]):
+     *
+     * 1. Subtract the window's on-screen location
+     *    ([android.view.View.getLocationOnScreen]) from the event
+     *    coordinates — this compensates the window offset.
+     * 2. If the display reports rotation, apply the inverse rotation using
+     *    the display's current real dimensions:
+     *    - `ROTATION_90`  (1): (x, y) → (y, w-1-x)
+     *    - `ROTATION_180` (2): (x, y) → (w-1-x, h-1-y)
+     *    - `ROTATION_270` (3): (x, y) → (h-1-y, x)
+     *
+     * The transform is applied to **every pointer** of the event, so
+     * multi-pointer gestures (pinch) are covered uniformly.
      */
     private fun dispatchToActivity(event: MotionEvent) {
         val activity = projectedActivity ?: return
@@ -429,7 +452,67 @@ class CarDisplay(
             gestureInProgress = false
             return
         }
-        activity.window?.decorView?.dispatchTouchEvent(event)
+
+        val decor: View = activity.window?.decorView ?: return
+        val display: Display = decor.display ?: run {
+            decor.dispatchTouchEvent(event)
+            return
+        }
+
+        // Window offset in display space (letterboxing shifts the window).
+        val loc = IntArray(2)
+        decor.getLocationOnScreen(loc)
+        val rotation = display.rotation
+        val rotated = rotation != Surface.ROTATION_0
+
+        // Log transform parameters once per gesture (first event only),
+        // to avoid spamming the log on every MOVE.
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN -> {
+                if (loc[0] != 0 || loc[1] != 0) {
+                    AALogger.d("CarDisplay: window offset=(${loc[0]},${loc[1]}) — compensating input coordinates")
+                }
+                if (rotated) {
+                    AALogger.w("CarDisplay: display rotation=$rotation — applying inverse rotation to touch input")
+                }
+            }
+        }
+
+        // Fast path: identity transform.
+        if (!rotated && loc[0] == 0 && loc[1] == 0) {
+            decor.dispatchTouchEvent(event)
+            return
+        }
+
+        val matrix = Matrix()
+        if (rotated) {
+            val metrics = DisplayMetrics()
+            @Suppress("DEPRECATION")
+            display.getRealMetrics(metrics)
+            val w = metrics.widthPixels
+            val h = metrics.heightPixels
+            when (rotation) {
+                Surface.ROTATION_90 -> {
+                    // (x, y) → (y, w-1-x), composed with the window offset.
+                    matrix.setRotate(-90f)
+                    matrix.postTranslate(-loc[1].toFloat(), (w - 1 + loc[0]).toFloat())
+                }
+                Surface.ROTATION_180 -> {
+                    // (x, y) → (w-1-x, h-1-y), composed with the window offset.
+                    matrix.setRotate(180f)
+                    matrix.postTranslate((w - 1 + loc[0]).toFloat(), (h - 1 + loc[1]).toFloat())
+                }
+                Surface.ROTATION_270 -> {
+                    // (x, y) → (h-1-y, x), composed with the window offset.
+                    matrix.setRotate(90f)
+                    matrix.postTranslate((h - 1 + loc[1]).toFloat(), -loc[0].toFloat())
+                }
+            }
+        } else {
+            matrix.postTranslate(-loc[0].toFloat(), -loc[1].toFloat())
+        }
+        event.transform(matrix)
+        decor.dispatchTouchEvent(event)
     }
 
     // -- click -------------------------------------------------------------
