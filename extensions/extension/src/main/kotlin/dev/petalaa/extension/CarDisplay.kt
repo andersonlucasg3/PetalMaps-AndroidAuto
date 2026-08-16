@@ -80,6 +80,14 @@ class CarDisplay(
     private var surfaceHeight: Int = 0
     private var surfaceDensity: Int = DisplayMetrics.DENSITY_DEFAULT
 
+    /**
+     * Last known valid landscape dimensions (width > height).
+     * Used as a fallback when the host reports transient portrait dims
+     * (e.g. 579x804) that would cause letterboxing on a landscape-only activity.
+     */
+    private var lastLandscapeW: Int = 0
+    private var lastLandscapeH: Int = 0
+
     /** Most recent touch position — used as anchor for scroll/fling. */
     private var lastTouchX: Float = 0f
     private var lastTouchY: Float = 0f
@@ -111,12 +119,20 @@ class CarDisplay(
      * 0 or negative, the container is considered invalid and **no display
      * is created** — we log an error and return `false`.
      *
-     * ## Orientation check
+     * ## Orientation check (portrait guard)
      *
      * `AutoPetalMapsActivity` is declared `screenOrientation="landscape"`.
-     * We expect `width > height` from the head-unit surface. If the
-     * reported dimensions are portrait (`height > width`) we log a warning
-     * but still use the container values as-is (no swap / invention).
+     * The host may transiently report portrait dimensions (e.g. 579x804)
+     * during initialization or rotation, which causes letterboxing.
+     *
+     * - If dims are landscape (width > height): create/update normally,
+     *   and remember as the last valid landscape.
+     * - If dims are portrait and we have a previous landscape: use the
+     *   last known landscape dimensions instead (avoid letterbox).
+     * - If dims are portrait and we have NO previous landscape: **do not
+     *   create the display** — wait for the next stable area update that
+     *   reports landscape. This keeps the template buttons visible while
+     *   the map stays out until we have correct dimensions.
      *
      * @return `true` if the VirtualDisplay was created and the activity
      *         was successfully requested, `false` otherwise.
@@ -139,15 +155,31 @@ class CarDisplay(
             return false
         }
 
-        // Orientation check: expect landscape (width > height) for AutoPetalMapsActivity
-        if (height > width) {
-            AALogger.w(
-                "Surface reports portrait dimensions (${width}x${height}) but " +
-                "AutoPetalMapsActivity is landscape — using container values as-is"
-            )
+        val isLandscape = width > height
+
+        if (isLandscape) {
+            // Normal case: landscape dims — use them and remember.
+            lastLandscapeW = width
+            lastLandscapeH = height
+            return create(surface, width, height, dpi)
         }
 
-        return create(surface, width, height, dpi)
+        // Portrait reported — host sent transient dims (e.g. 579x804).
+        if (lastLandscapeW > 0 && lastLandscapeH > 0) {
+            // We have a previous valid landscape — use it to avoid letterbox.
+            AALogger.w(
+                "Surface reports portrait (${width}x${height}) but we have a valid " +
+                "landscape (${lastLandscapeW}x${lastLandscapeH}) — using last landscape"
+            )
+            return create(surface, lastLandscapeW, lastLandscapeH, dpi)
+        }
+
+        // No previous landscape known — wait for the host to send proper dims.
+        AALogger.w(
+            "Surface reports portrait (${width}x${height}) with no prior landscape — " +
+            "skipping VirtualDisplay creation (waiting for stable landscape dims)"
+        )
+        return false
     }
 
     /**
@@ -170,6 +202,12 @@ class CarDisplay(
         surfaceHeight = height
         surfaceDensity = density
 
+        // Remember valid landscape dims for fallback on transient portrait reports.
+        if (width > height) {
+            lastLandscapeW = width
+            lastLandscapeH = height
+        }
+
         val displayManager = context.getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
 
         try {
@@ -189,6 +227,7 @@ class CarDisplay(
         val vd = virtualDisplay ?: return false
         displayId = vd.display.displayId
         AALogger.i("VirtualDisplay created: id=$displayId, ${width}x${height}, density=$density")
+        AALogger.shareableCopy()
 
         // Register lifecycle callbacks BEFORE launching the activity so we
         // can catch onActivityCreated and auto-attach it.
@@ -214,6 +253,7 @@ class CarDisplay(
             if (stderr.isNotBlank()) {
                 AALogger.d("CarDisplay: am start stderr=${stderr.trim()}")
             }
+            AALogger.shareableCopy()
         } else {
             AALogger.w(
                 "CarDisplay: am start failed (exit=$exitCode, out='${stdout.trim()}', " +
@@ -240,14 +280,17 @@ class CarDisplay(
                 AALogger.i("CarDisplay: fallback startActivity succeeded")
             } catch (e: SecurityException) {
                 AALogger.e("CarDisplay: fallback startActivity blocked: ${e.message}", e)
+                AALogger.shareableCopy()
                 destroy()
                 return false
             } catch (e: IllegalStateException) {
                 AALogger.e("CarDisplay: fallback startActivity error: ${e.message}", e)
+                AALogger.shareableCopy()
                 destroy()
                 return false
             } catch (e: Exception) {
                 AALogger.e("CarDisplay: fallback startActivity failed: ${e.message}", e)
+                AALogger.shareableCopy()
                 destroy()
                 return false
             }
@@ -303,6 +346,7 @@ class CarDisplay(
                     activity.javaClass.name == targetActivityClass) {
                     projectedActivity = activity
                     AALogger.i("Activity auto-attached for touch dispatch: ${activity.javaClass.simpleName}")
+                    AALogger.shareableCopy()
                 }
             }
 

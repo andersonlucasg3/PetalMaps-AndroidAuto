@@ -42,6 +42,7 @@ class PetalSession : Session() {
             AALogger.i("Registering SurfaceCallback with AppManager")
             val appManager = carContext.getCarService(AppManager::class.java)
             appManager.setSurfaceCallback(createSurfaceCallback())
+            AALogger.shareableCopy()
         }
 
         return MapScreen(carContext, carDisplay)
@@ -56,6 +57,7 @@ class PetalSession : Session() {
                 AALogger.i("onSurfaceAvailable: width=${container.width}, height=${container.height}, density=${container.dpi}")
                 lastContainer = container
                 createDisplayFromContainer(container)
+                AALogger.shareableCopy()
             }
 
             override fun onSurfaceDestroyed(container: SurfaceContainer) {
@@ -90,6 +92,7 @@ class PetalSession : Session() {
                             val surface: Surface = container.surface ?: return
                             val density = container.dpi
                             carDisplay.create(surface, stableArea.width(), stableArea.height(), density)
+                            AALogger.shareableCopy()
                         }
                     }
                 }
