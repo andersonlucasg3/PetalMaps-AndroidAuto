@@ -1,7 +1,7 @@
 {
-    "version": "1.1.21",
-    "created_at": "2026-08-16T13:49:04",
-    "description": "Switch projection target to the standard PetalMapsActivity (forced sensorLandscape via manifest patch), drop the ActionStrip (map fills the car screen, pinch to zoom), and DiLink-style car mode: SCREEN_BRIGHT wakelock + lockscreen off + physical panel power-off (projection keeps rendering, zero panel battery drain).\n\n- **Android Auto**: injects PetalCarAppService and projects the built-in HiCar automotive UI (AutoPetalMapsActivity) onto the head-unit surface via VirtualDisplay, with synthetic pan/zoom/recenter gestures.\n- **Anti-Repack Bypass**: neutralises the native SecurityDetect.irpj() integrity check that kills the process on re-signed APKs.\n- **Manufacturer Check Bypass**: removes the Huawei/Honor-only device gate.\n- **Change package name**: install alongside the original app (default: morphe.huawei.petal.maps).",
-    "download_url": "https://github.com/andersonlucasg3/PetalMaps-AndroidAuto/releases/download/v1.1.21/patches-1.1.21.mpp",
+    "version": "1.1.22",
+    "created_at": "2026-08-16T14:01:46",
+    "description": "Fix 100% crash: restore the NavigationTemplate ActionStrip — androidx.car.app 1.7 requires it (build() throws IllegalStateException without it).\n\n- **Android Auto**: injects PetalCarAppService and projects the built-in HiCar automotive UI (AutoPetalMapsActivity) onto the head-unit surface via VirtualDisplay, with synthetic pan/zoom/recenter gestures.\n- **Anti-Repack Bypass**: neutralises the native SecurityDetect.irpj() integrity check that kills the process on re-signed APKs.\n- **Manufacturer Check Bypass**: removes the Huawei/Honor-only device gate.\n- **Change package name**: install alongside the original app (default: morphe.huawei.petal.maps).",
+    "download_url": "https://github.com/andersonlucasg3/PetalMaps-AndroidAuto/releases/download/v1.1.22/patches-1.1.22.mpp",
     "signature_download_url": ""
 }
