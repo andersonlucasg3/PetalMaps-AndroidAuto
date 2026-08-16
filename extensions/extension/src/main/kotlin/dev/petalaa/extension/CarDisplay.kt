@@ -233,14 +233,26 @@ class CarDisplay(
         // can catch onActivityCreated and auto-attach it.
         registerLifecycleCallbacks()
 
+        // If the activity is already attached and alive on the current
+        // display, skip the am start — with MULTIPLE_TASK removed a relaunch
+        // would just reuse the same task anyway.
+        val attached = projectedActivity
+        if (attached != null && !attached.isFinishing && !attached.isDestroyed) {
+            AALogger.i("CarDisplay: activity already attached on display $displayId — skipping am start")
+            AALogger.shareableCopy()
+            return true
+        }
+
         // Launch the activity on the virtual display via `am start` as root.
         // Ordinary apps cannot use ActivityOptions.setLaunchDisplayId on a
         // VirtualDisplay they own (SecurityException: Permission Denial).
         // The `am start --display <id>` approach works because it runs as
         // system server via su.
         val componentName = "${context.packageName}/$targetActivityClass"
-        // Flags: NEW_TASK(0x10000000) | MULTIPLE_TASK(0x00080000) | EXCLUDE_FROM_RECENTS(0x00002000)
-        val flagsDecimal = 0x10000000 or 0x00080000 or 0x00002000 // 269967936
+        // Flags: NEW_TASK(0x10000000) | EXCLUDE_FROM_RECENTS(0x00002000)
+        // MULTIPLE_TASK was removed: each relaunch used to spawn a NEW task,
+        // leaving orphan windows with inherited/letterboxed bounds.
+        val flagsDecimal = 0x10000000 or 0x00002000 // 268443648
         val amCmd = "am start -n $componentName --display $displayId -f $flagsDecimal"
         AALogger.i("CarDisplay: launching via root: $amCmd")
 
@@ -267,7 +279,6 @@ class CarDisplay(
                     setClassName(context.packageName, targetActivityClass)
                     addFlags(
                         Intent.FLAG_ACTIVITY_NEW_TASK or
-                        Intent.FLAG_ACTIVITY_MULTIPLE_TASK or
                         Intent.FLAG_ACTIVITY_EXCLUDE_FROM_RECENTS
                     )
                 }
@@ -304,6 +315,19 @@ class CarDisplay(
      * the surface. Call from [SurfaceCallback.onSurfaceDestroyed].
      */
     fun destroy() {
+        // Finish the projected activity BEFORE releasing the display so no
+        // orphan windows are left on a dead display.
+        val activity = projectedActivity
+        if (activity != null) {
+            try {
+                AALogger.i("Finishing projected activity before destroying display (id=$displayId)")
+                activity.finish()
+            } catch (e: Exception) {
+                AALogger.w("Failed to finish projected activity: ${e.message}")
+            }
+            projectedActivity = null
+        }
+
         unregisterLifecycleCallbacks()
 
         val vd = virtualDisplay
@@ -316,7 +340,6 @@ class CarDisplay(
             }
             virtualDisplay = null
         }
-        projectedActivity = null
         displayId = -1
         gestureInProgress = false
     }
@@ -342,10 +365,13 @@ class CarDisplay(
                 }
                 AALogger.d("onActivityCreated: ${activity.javaClass.simpleName} on display $activityDisplayId")
 
-                if (activityDisplayId == targetId &&
+                // Attach ONLY if the activity lives on the CURRENT live
+                // display — never attach an instance from a destroyed one.
+                if (displayId != -1 && virtualDisplay != null &&
+                    activityDisplayId == displayId &&
                     activity.javaClass.name == targetActivityClass) {
                     projectedActivity = activity
-                    AALogger.i("Activity auto-attached for touch dispatch: ${activity.javaClass.simpleName}")
+                    AALogger.i("Activity auto-attached for touch dispatch: ${activity.javaClass.simpleName} on display $activityDisplayId")
                     AALogger.shareableCopy()
                 }
             }
@@ -388,7 +414,22 @@ class CarDisplay(
      * view. Silently dropped if the activity hasn't been attached yet.
      */
     private fun dispatchToActivity(event: MotionEvent) {
-        projectedActivity?.window?.decorView?.dispatchTouchEvent(event)
+        val activity = projectedActivity ?: return
+        // Never dispatch touch to an instance living on a destroyed display.
+        if (displayId == -1 || virtualDisplay == null) return
+        val activityDisplayId = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            activity.display?.displayId ?: -1
+        } else {
+            @Suppress("DEPRECATION")
+            activity.windowManager.defaultDisplay?.displayId ?: -1
+        }
+        if (activityDisplayId != displayId) {
+            AALogger.w("dispatchToActivity: activity on stale display $activityDisplayId (current=$displayId) — detaching and dropping event")
+            projectedActivity = null
+            gestureInProgress = false
+            return
+        }
+        activity.window?.decorView?.dispatchTouchEvent(event)
     }
 
     // -- click -------------------------------------------------------------
