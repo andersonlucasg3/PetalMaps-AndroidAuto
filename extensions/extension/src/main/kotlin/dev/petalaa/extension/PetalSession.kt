@@ -4,12 +4,16 @@ import android.content.Intent
 import android.graphics.Rect
 import android.os.Handler
 import android.os.Looper
+import android.os.PowerManager
 import android.view.Surface
 import androidx.car.app.AppManager
 import androidx.car.app.Screen
 import androidx.car.app.Session
 import androidx.car.app.SurfaceCallback
 import androidx.car.app.SurfaceContainer
+import androidx.lifecycle.DefaultLifecycleObserver
+import androidx.lifecycle.LifecycleOwner
+import kotlin.concurrent.thread
 import kotlin.math.abs
 
 /**
@@ -18,7 +22,7 @@ import kotlin.math.abs
  *
  * The [SurfaceCallback] is registered with [AppManager] once per session
  * and survives screen transitions. It creates a [VirtualDisplay] on the
- * host-provided surface and projects `AutoPetalMapsActivity` onto it.
+ * host-provided surface and projects `PetalMapsActivity` onto it.
  *
  * ## Resize handling
  *
@@ -53,9 +57,120 @@ class PetalSession : Session() {
             val appManager = carContext.getCarService(AppManager::class.java)
             appManager.setSurfaceCallback(createSurfaceCallback())
             AALogger.shareableCopy()
+
+            // Enable car mode once per session: the wakelock keeps the
+            // VirtualDisplay composition alive; keyguard and physical panel
+            // are managed inside enableCarMode().
+            enableCarMode()
         }
 
         return MapScreen(carContext, carDisplay)
+    }
+
+    // ---- Car mode (wakelock + keyguard off + panel off while projecting) ---
+
+    /** Held for the whole car session so SurfaceFlinger keeps composing. */
+    @Volatile
+    private var wakeLock: PowerManager.WakeLock? = null
+
+    /** Maintenance thread re-powering the panel off and renewing the wakelock. */
+    @Volatile
+    private var panelOffThread: Thread? = null
+
+    /**
+     * During the car session: hold a SCREEN_BRIGHT wakelock (keeps the display
+     * logically ON so VirtualDisplay composition keeps running — no root
+     * needed for that), disable the keyguard and power the physical panel
+     * OFF — projection does not need the panel (the VD is virtual) and this
+     * saves battery. Wake sources (notifications, charger) can re-power the
+     * panel, so a maintenance loop re-enforces panel-off and renews the
+     * wakelock every ~30s. Everything is restored when the session ends
+     * ([disableCarMode]).
+     */
+    private fun enableCarMode() {
+        if (wakeLock != null) return
+        val pm = carContext.getSystemService(PowerManager::class.java)
+        wakeLock = pm?.newWakeLock(
+            PowerManager.SCREEN_BRIGHT_WAKE_LOCK,
+            "PetalAA:aaSession"
+        )?.apply {
+            setReferenceCounted(false)
+            acquire(WAKELOCK_TIMEOUT_MS)
+        }
+        if (wakeLock == null) {
+            AALogger.e("CarMode: PowerManager unavailable — car mode not enabled")
+            return
+        }
+        AALogger.i("CarMode: SCREEN_BRIGHT_WAKE_LOCK acquired (${WAKELOCK_TIMEOUT_MS}ms timeout)")
+        AALogger.w(
+            "CarMode: if the app dies while enabled, the panel powers back on the next " +
+                "natural wake, but lockscreen_disabled stays 1 until a next session reverts it"
+        )
+
+        panelOffThread = thread(name = "PetalAACarMode") {
+            if (wakeLock == null) return@thread // session ended before we started
+            runCarModeCommand("settings put secure lockscreen_disabled 1")
+            while (true) {
+                val wl = wakeLock ?: break
+                // The wakelock has a safety timeout — renew it every cycle so
+                // a long car session never lets the display suspend.
+                wl.acquire(WAKELOCK_TIMEOUT_MS)
+                // Raced with disableCarMode()? Undo the stray re-acquire.
+                if (wakeLock !== wl) {
+                    if (wl.isHeld) wl.release()
+                    break
+                }
+                runCarModeCommand("cmd display power-off 0")
+                try {
+                    Thread.sleep(PANEL_REOFF_INTERVAL_MS)
+                } catch (_: InterruptedException) {
+                    break
+                }
+            }
+        }
+        AALogger.shareableCopy()
+
+        // car-app 1.7.0 has no Session.onCarSessionFinished(); the session
+        // lifecycle reaches DESTROYED when the car connection ends
+        // (CarAppBinder.onAppDestroy -> handleLifecycleEvent(ON_DESTROY)).
+        lifecycle.addObserver(object : DefaultLifecycleObserver {
+            override fun onDestroy(owner: LifecycleOwner) {
+                AALogger.i("CarMode: session lifecycle destroyed — reverting")
+                disableCarMode()
+            }
+        })
+    }
+
+    /**
+     * Stops the maintenance thread, releases the wakelock and restores the
+     * panel and keyguard. Idempotent. Root commands run on a background
+     * thread — session lifecycle callbacks arrive on the main thread.
+     */
+    private fun disableCarMode() {
+        if (wakeLock == null) return
+        panelOffThread?.interrupt()
+        panelOffThread = null
+        wakeLock?.let {
+            if (it.isHeld) it.release()
+        }
+        wakeLock = null
+        AALogger.i("CarMode: wakelock released — restoring panel + keyguard")
+        thread(name = "PetalAACarModeRestore") {
+            runCarModeCommand("cmd display power-on 0")
+            runCarModeCommand("settings put secure lockscreen_disabled 0")
+            AALogger.shareableCopy()
+        }
+    }
+
+    /** Runs one car-mode shell command and logs command and result. */
+    private fun runCarModeCommand(command: String) {
+        AALogger.i("CarMode: executing '$command'")
+        val (exit, _, stderr) = RootShell.run(command)
+        if (exit == 0) {
+            AALogger.i("CarMode: '$command' -> OK")
+        } else {
+            AALogger.e("CarMode: '$command' -> FAILED (exit=$exit, stderr=${stderr.trim()})")
+        }
     }
 
     // ---- SurfaceCallback factory ------------------------------------------
@@ -187,5 +302,13 @@ class PetalSession : Session() {
                 carDisplay.create(surface, width, height, container.dpi)
             }
         }
+    }
+
+    private companion object {
+        /** Wakelock safety timeout, renewed every maintenance cycle. */
+        private const val WAKELOCK_TIMEOUT_MS = 4 * 60 * 60 * 1000L
+
+        /** How often to re-power-off the panel and renew the wakelock. */
+        private const val PANEL_REOFF_INTERVAL_MS = 30_000L
     }
 }

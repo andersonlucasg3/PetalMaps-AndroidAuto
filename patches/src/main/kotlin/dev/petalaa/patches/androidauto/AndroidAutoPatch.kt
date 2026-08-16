@@ -11,7 +11,7 @@ import dev.petalaa.patches.androidauto.Constants.COMPATIBILITY_PETAL_MAPS
  * - [androidAutoManifestPatch]: AndroidManifest.xml edits (service, meta-data, permissions)
  * - [androidAutoResourcesPatch]: automotive_app_desc.xml resource
  * - [androidAutoApiLevelPatch]: car-app-api.level classpath resource
- * - [automotiveOrientationPatch]: AutoPetalMapsActivity screenOrientation fix
+ * - [automotiveOrientationPatch]: PetalMapsActivity screenOrientation fix
  *
  * The following patches are NOT included as dependencies (they are recommended
  * but kept separate for easier debugging and optional use):

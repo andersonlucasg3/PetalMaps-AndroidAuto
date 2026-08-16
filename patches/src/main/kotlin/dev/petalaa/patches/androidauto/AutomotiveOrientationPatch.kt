@@ -5,29 +5,29 @@ import dev.petalaa.patches.androidauto.Constants.COMPATIBILITY_PETAL_MAPS
 import org.w3c.dom.Element
 
 /**
- * Resource patch that changes AutoPetalMapsActivity's screenOrientation from
- * "landscape" to "unspecified".
+ * Resource patch that changes PetalMapsActivity's screenOrientation from
+ * "behind" to "sensorLandscape".
  *
- * Petal Maps declares this activity with android:screenOrientation="landscape".
- * When rendered on a VirtualDisplay (Android Auto projection), the system
- * rotates the window artificially (touch input ends up inverted 180°) and
- * applies letterboxing to the portrait layout. "unspecified" lets the activity
- * follow the display orientation (our VirtualDisplay is landscape).
+ * Petal Maps declares the main activity with android:screenOrientation="behind",
+ * so on the car display it follows the orientation of the activity behind it
+ * and renders in portrait. "sensorLandscape" fixes it to landscape in both
+ * directions without forcing a specific rotation (avoids the inverted 180°
+ * touch input).
  *
- * Idempotent: no-op if the attribute is missing or already "unspecified".
+ * Idempotent: no-op if the attribute is missing or already "sensorLandscape".
  */
 @Suppress("unused")
 val automotiveOrientationPatch = resourcePatch(
-    name = "Automotive orientation fix",
-    description = "Changes AutoPetalMapsActivity's screenOrientation from " +
-            "landscape to unspecified so it follows the VirtualDisplay orientation.",
+    name = "Automotive orientation fix (main activity)",
+    description = "Changes PetalMapsActivity's screenOrientation from " +
+            "behind to sensorLandscape so it renders in landscape on the car display.",
     default = true,
 ) {
     compatibleWith(COMPATIBILITY_PETAL_MAPS)
 
     execute {
         document("AndroidManifest.xml").use { doc ->
-            val activityName = "com.huawei.maps.auto.activity.AutoPetalMapsActivity"
+            val activityName = "com.huawei.maps.app.petalmaps.PetalMapsActivity"
             val activities = doc.getElementsByTagName("activity")
             val activity = (0 until activities.length)
                 .asSequence()
@@ -44,12 +44,12 @@ val automotiveOrientationPatch = resourcePatch(
                 orientation.isEmpty() ->
                     println("Automotive orientation fix: $activityName has no android:screenOrientation — no-op")
 
-                orientation == "unspecified" ->
-                    println("Automotive orientation fix: $activityName already has screenOrientation=\"unspecified\" — no-op")
+                orientation == "sensorLandscape" ->
+                    println("Automotive orientation fix: $activityName already has screenOrientation=\"sensorLandscape\" — no-op")
 
                 else -> {
-                    activity.setAttribute("android:screenOrientation", "unspecified")
-                    println("Automotive orientation fix: $activityName screenOrientation \"$orientation\" -> \"unspecified\"")
+                    activity.setAttribute("android:screenOrientation", "sensorLandscape")
+                    println("Automotive orientation fix: $activityName screenOrientation \"$orientation\" -> \"sensorLandscape\"")
                 }
             }
         }
