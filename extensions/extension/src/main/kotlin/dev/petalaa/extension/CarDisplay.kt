@@ -16,7 +16,6 @@ import android.view.MotionEvent
 import android.view.Surface
 import android.view.View
 import androidx.car.app.SurfaceContainer
-import java.lang.reflect.Method
 
 /**
  * Helper that manages a [VirtualDisplay] projecting `PetalMapsActivity`
@@ -36,12 +35,6 @@ import java.lang.reflect.Method
  * The activity is auto-attached via [Application.ActivityLifecycleCallbacks]:
  * when `onActivityCreated` fires for an activity whose display ID matches
  * our VirtualDisplay, we save the reference for touch dispatch.
- *
- * ## Re-center
- *
- * Calls `AutoLocationHelper.v().moveToLocation(mode)` via reflection.
- * The mode is obtained from `mj9.F().i()` (0=3D car, 1=visual car, 2=normal).
- * This is the same call chain the HiCar location button uses.
  */
 class CarDisplay(
     private val context: Context,
@@ -801,58 +794,4 @@ class CarDisplay(
         up.recycle()
         gestureInProgress = false
     }
-
-    // ---- ActionStrip button handlers -------------------------------------
-
-    /** Notify that a zoom-in button was pressed. */
-    fun zoomIn() {
-        val cx = surfaceWidth / 2f
-        val cy = surfaceHeight / 2f
-        dispatchScale(1.5f, cx, cy)
-    }
-
-    /** Notify that a zoom-out button was pressed. */
-    fun zoomOut() {
-        val cx = surfaceWidth / 2f
-        val cy = surfaceHeight / 2f
-        dispatchScale(0.67f, cx, cy)
-    }
-
-    /**
-     * Re-center the map on the user's current location.
-     *
-     * Calls `AutoLocationHelper.v().moveToLocation(mode)` via reflection,
-     * replicating the HiCar location-button flow. The visual mode is read
-     * from `mj9.F().i()` (0=3D car heading, 1=visual car, 2=normal).
-     *
-     * If reflection fails (class/method not found), falls back to a
-     * center-click and logs a warning.
-     */
-    @Suppress("UNCHECKED_CAST")
-    fun reCenter() {
-        try {
-            // Read the current visual mode: mj9.F().i()
-            val mj9Class = Class.forName("defpackage.mj9")
-            val fMethod: Method = mj9Class.getMethod("F")
-            val mj9Instance = fMethod.invoke(null)
-            val iMethod: Method = mj9Class.getMethod("i")
-            val mode = (iMethod.invoke(mj9Instance) as Int?) ?: 2
-
-            // Call AutoLocationHelper.v().moveToLocation(mode)
-            val autoLocClass = Class.forName("com.huawei.maps.auto.location.AutoLocationHelper")
-            val vMethod: Method = autoLocClass.getMethod("v")
-            val locInstance = vMethod.invoke(null)
-            val moveMethod: Method = autoLocClass.getMethod("moveToLocation", Int::class.javaPrimitiveType)
-            moveMethod.invoke(locInstance, mode)
-
-            AALogger.i("reCenter: called AutoLocationHelper.v().moveToLocation($mode)")
-        } catch (e: Exception) {
-            AALogger.w("reCenter: reflection failed (${e.message}), falling back to center-click")
-            // Fallback: tap the center of the screen
-            val cx = surfaceWidth / 2f
-            val cy = surfaceHeight / 2f
-            dispatchClick(cx, cy)
-        }
-    }
-
-    }
+}
