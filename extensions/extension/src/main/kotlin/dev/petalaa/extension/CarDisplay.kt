@@ -35,6 +35,11 @@ import androidx.car.app.SurfaceContainer
  * The activity is auto-attached via [Application.ActivityLifecycleCallbacks]:
  * when `onActivityCreated` fires for an activity whose display ID matches
  * our VirtualDisplay, we save the reference for touch dispatch.
+ *
+ * On `onActivityResumed`, the attached activity is forced into
+ * `SCREEN_ORIENTATION_SENSOR_LANDSCAPE` (once per activity instance) to
+ * avoid a portrait/letterboxed window, and its live bounds are logged
+ * ~2s later for remote letterbox diagnosis.
  */
 class CarDisplay(
     private val context: Context,
@@ -66,6 +71,9 @@ class CarDisplay(
         private val VIRTUAL_DISPLAY_FLAGS =
             DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY or
             DisplayManager.VIRTUAL_DISPLAY_FLAG_PRESENTATION
+
+        /** Delay before logging post-orientation window bounds for diagnosis. */
+        private const val ORIENTATION_BOUNDS_LOG_DELAY_MS = 2_000L
     }
 
     // ---- state -----------------------------------------------------------
@@ -101,6 +109,9 @@ class CarDisplay(
 
     /** Our lifecycle callbacks; stored so we can unregister on destroy. */
     private var lifecycleCallbacks: Application.ActivityLifecycleCallbacks? = null
+
+    /** Activity we already forced landscape on — applied once per instance. */
+    private var orientationForcedOn: Activity? = null
 
     // ---- VirtualDisplay management ---------------------------------------
 
@@ -337,6 +348,7 @@ class CarDisplay(
                 AALogger.w("Failed to finish projected activity: ${e.message}")
             }
             projectedActivity = null
+            orientationForcedOn = null
         }
 
         unregisterLifecycleCallbacks()
@@ -453,10 +465,44 @@ class CarDisplay(
                     gestureInProgress = false
                     AALogger.i("Projected activity destroyed, detached")
                 }
+                if (activity === orientationForcedOn) {
+                    orientationForcedOn = null
+                }
             }
 
             override fun onActivityStarted(activity: Activity) {}
-            override fun onActivityResumed(activity: Activity) {}
+            override fun onActivityResumed(activity: Activity) {
+                // Attached instance only, and once per activity instance —
+                // re-applying on every resume would restart the activity.
+                if (activity !== projectedActivity || orientationForcedOn === activity) return
+                orientationForcedOn = activity
+
+                val before = activity.requestedOrientation
+                AALogger.i(
+                    "CarDisplay: forcing landscape on ${activity.javaClass.simpleName} " +
+                        "(requestedOrientation=$before)"
+                )
+                activity.requestedOrientation =
+                    android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+                AALogger.i(
+                    "CarDisplay: requestedOrientation=${activity.requestedOrientation} " +
+                        "(SCREEN_ORIENTATION_SENSOR_LANDSCAPE=" +
+                        "${android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE})"
+                )
+                AALogger.shareableCopy()
+
+                // After ~2s the window has (re)laid out — log live bounds to
+                // diagnose letterboxing remotely.
+                activity.window?.decorView?.postDelayed(
+                    {
+                        if (projectedActivity === activity) {
+                            logWindowBounds(activity, "post-orientation")
+                            AALogger.shareableCopy()
+                        }
+                    },
+                    ORIENTATION_BOUNDS_LOG_DELAY_MS
+                )
+            }
             override fun onActivityPaused(activity: Activity) {}
             override fun onActivityStopped(activity: Activity) {}
             override fun onActivitySaveInstanceState(activity: Activity, outState: Bundle) {}

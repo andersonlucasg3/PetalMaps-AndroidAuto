@@ -6,7 +6,7 @@ import org.w3c.dom.Element
 
 /**
  * Resource patch that changes PetalMapsActivity's screenOrientation from
- * "behind" to "sensorLandscape".
+ * "behind" to "sensorLandscape" and sets android:resizeableActivity="true".
  *
  * Petal Maps declares the main activity with android:screenOrientation="behind",
  * so on the car display it follows the orientation of the activity behind it
@@ -14,7 +14,8 @@ import org.w3c.dom.Element
  * directions without forcing a specific rotation (avoids the inverted 180°
  * touch input).
  *
- * Idempotent: no-op if the attribute is missing or already "sensorLandscape".
+ * Idempotent: no-op if screenOrientation is missing or already
+ * "sensorLandscape", and if resizeableActivity is already "true".
  */
 @Suppress("unused")
 val automotiveOrientationPatch = resourcePatch(
@@ -50,6 +51,20 @@ val automotiveOrientationPatch = resourcePatch(
                 else -> {
                     activity.setAttribute("android:screenOrientation", "sensorLandscape")
                     println("Automotive orientation fix: $activityName screenOrientation \"$orientation\" -> \"sensorLandscape\"")
+                }
+            }
+
+            // The system letterboxes non-resizable activities in a landscape
+            // VirtualDisplay, so force resizability in addition to the orientation.
+            val resizeable = activity.getAttribute("android:resizeableActivity")
+            when {
+                resizeable == "true" ->
+                    println("Automotive orientation fix: $activityName already has resizeableActivity=\"true\" — no-op")
+
+                else -> {
+                    activity.setAttribute("android:resizeableActivity", "true")
+                    val from = if (resizeable.isEmpty()) "missing" else "\"$resizeable\""
+                    println("Automotive orientation fix: $activityName resizeableActivity $from -> \"true\"")
                 }
             }
         }
