@@ -5,21 +5,45 @@ import android.app.ActivityManager
 import android.app.Application
 import android.content.Context
 import android.content.Intent
+import android.graphics.Bitmap
 import android.graphics.Matrix
+import android.graphics.Paint
+import android.graphics.PixelFormat
+import android.graphics.Rect
+import android.graphics.RectF
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
+import android.media.ImageReader
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.HandlerThread
+import android.os.SystemClock
 import android.util.DisplayMetrics
 import android.view.Display
 import android.view.MotionEvent
+import android.view.PixelCopy
 import android.view.Surface
 import android.view.View
+import androidx.annotation.RequiresApi
 import androidx.car.app.SurfaceContainer
+import java.util.concurrent.atomic.AtomicReference
+import kotlin.math.max
 
 /**
  * Helper that manages a [VirtualDisplay] projecting `PetalMapsActivity`
- * onto the [Surface] provided by Android Auto.
+ * and renders it onto the [Surface] provided by Android Auto.
+ *
+ * ## Rendering pipeline
+ *
+ * The VirtualDisplay is decoupled from the car surface: it renders onto a
+ * private [ImageReader]-backed [Surface] (frames discarded — the reader
+ * only keeps the display's buffer queue drained), while a dedicated
+ * capture thread samples the projected activity's window every ~500ms via
+ * [PixelCopy] and draws the latest frame onto the car surface with a
+ * crop-to-fill (cover) transform, so portrait-letterboxed window content
+ * fills the whole landscape car surface. On capture failure the last
+ * valid frame stays on screen (never black).
  *
  * ## Input injection strategy
  *
@@ -74,6 +98,15 @@ class CarDisplay(
 
         /** Delay before logging post-orientation window bounds for diagnosis. */
         private const val ORIENTATION_BOUNDS_LOG_DELAY_MS = 2_000L
+
+        /** Fixed interval between PixelCopy capture iterations. */
+        private const val CAPTURE_INTERVAL_MS = 500L
+
+        /** Minimum interval between rate-limited capture-failure warnings. */
+        private const val COPY_FAIL_LOG_INTERVAL_MS = 30_000L
+
+        /** Name of the dedicated capture thread. */
+        private const val CAPTURE_THREAD_NAME = "PetalAA-Capture"
     }
 
     // ---- state -----------------------------------------------------------
@@ -113,6 +146,65 @@ class CarDisplay(
     /** Activity we already forced landscape on — applied once per instance. */
     private var orientationForcedOn: Activity? = null
 
+    // ---- Decoupled rendering state ----------------------------------------
+
+    /** Car surface (draw target) from the last SurfaceContainer. */
+    private var carSurface: Surface? = null
+
+    /** Dimensions of the car surface — the draw destination. */
+    private var carWidth: Int = 0
+    private var carHeight: Int = 0
+
+    /**
+     * Private ImageReader (frame sink) + its Surface — the VirtualDisplay
+     * renders onto this, never onto the car surface. Arriving frames are
+     * discarded immediately; consumption happens via PixelCopy of the
+     * projected window. The Surface belongs to the ImageReader — it must
+     * NOT be released manually, [ImageReader.close] does it.
+     */
+    private var imageReader: ImageReader? = null
+    private var virtualSurface: Surface? = null
+
+    /** Capture thread + handler; PixelCopy and the surface draw run here. */
+    private var captureThread: HandlerThread? = null
+    private var captureHandler: Handler? = null
+
+    /** Bitmap being filled by the in-flight PixelCopy (capture thread only). */
+    private var captureBitmap: Bitmap? = null
+    private var captureBitmapW: Int = 0
+    private var captureBitmapH: Int = 0
+    private var captureInFlight: Boolean = false
+
+    /** Last successfully copied frame — kept on screen when capture fails. */
+    private val lastFrame = AtomicReference<Bitmap?>()
+
+    /** Result-state tracking so PixelCopy outcomes are logged only on change. */
+    private var lastCopySuccess: Boolean = true
+    private var lastCopyFailLogAt: Long = 0L
+    private var firstFrameDrawn: Boolean = false
+
+    /**
+     * Crop-to-fill mapping of the last drawn frame (capture thread writes,
+     * main thread reads for input). A car-surface point (x, y) maps to the
+     * window point (x / cropScale + cropSrcX, y / cropScale + cropSrcY).
+     */
+    @Volatile private var cropScale: Float = 1f
+    @Volatile private var cropSrcX: Int = 0
+    @Volatile private var cropSrcY: Int = 0
+
+    /** Whether the input crop mapping has been logged (once per display). */
+    private var inputMappingLogged: Boolean = false
+
+    /** Last logged draw transform — the draw log fires only on change. */
+    private var lastDrawScale: Float = -1f
+    private var lastDrawSrcX: Int = -1
+    private var lastDrawSrcY: Int = -1
+    private var lastDrawDstW: Int = -1
+    private var lastDrawDstH: Int = -1
+
+    /** Paint for the frame draw — bilinear filtering for scaling. */
+    private val drawPaint = Paint(Paint.FILTER_BITMAP_FLAG)
+
     // ---- VirtualDisplay management ---------------------------------------
 
     /**
@@ -121,8 +213,10 @@ class CarDisplay(
      * [SurfaceCallback.onSurfaceAvailable].
      *
      * Extracts the surface, dimensions, and dpi **from the container**
-     * (not from [carContext] phone metrics) and delegates to
-     * [create][create(surface,width,height,density)].
+     * (not from [carContext] phone metrics). The container's surface becomes
+     * the **draw target** of the capture loop; the VirtualDisplay itself
+     * renders onto a private ImageReader-backed surface (see
+     * [createDisplay]).
      *
      * ## Dimension validation
      *
@@ -150,7 +244,7 @@ class CarDisplay(
      */
     fun create(container: SurfaceContainer): Boolean {
         val surface: Surface = container.surface ?: run {
-            AALogger.e("onSurfaceAvailable: surface is null — cannot create VirtualDisplay")
+            AALogger.e("onSurfaceAvailable: surface is null — nothing to draw the map onto")
             return false
         }
 
@@ -172,7 +266,10 @@ class CarDisplay(
             // Normal case: landscape dims — use them and remember.
             lastLandscapeW = width
             lastLandscapeH = height
-            return create(surface, width, height, dpi)
+            carSurface = surface
+            carWidth = width
+            carHeight = height
+            return createDisplay(width, height, dpi)
         }
 
         // Portrait reported — host sent transient dims (e.g. 579x804).
@@ -182,7 +279,12 @@ class CarDisplay(
                 "Surface reports portrait (${width}x${height}) but we have a valid " +
                 "landscape (${lastLandscapeW}x${lastLandscapeH}) — using last landscape"
             )
-            return create(surface, lastLandscapeW, lastLandscapeH, dpi)
+            // The car surface keeps its real dims for the draw dst; only the
+            // VirtualDisplay uses the remembered landscape dims.
+            carSurface = surface
+            carWidth = width
+            carHeight = height
+            return createDisplay(lastLandscapeW, lastLandscapeH, dpi)
         }
 
         // No previous landscape known — wait for the host to send proper dims.
@@ -194,30 +296,55 @@ class CarDisplay(
     }
 
     /**
-     * Creates a [VirtualDisplay] on [surface] and launches the target
-     * activity onto it. Prefer [create(SurfaceContainer)] for initial
-     * creation; this overload is used for resize / recreation flows
-     * where explicit dimensions are needed (e.g. from
-     * [SurfaceCallback.onStableAreaChanged]).
+     * Creates a [VirtualDisplay] at explicit dimensions and launches the
+     * target activity onto it. Used for resize / recreation flows (e.g.
+     * from [SurfaceCallback.onStableAreaChanged]) — the car surface is
+     * already held from the last [SurfaceContainer].
      */
-    fun create(surface: Surface, width: Int, height: Int, density: Int): Boolean {
+    fun create(width: Int, height: Int, density: Int): Boolean {
         // Guard: 0 / negative dimensions → bail out
         if (width <= 0 || height <= 0) {
             AALogger.e("Cannot create VirtualDisplay: invalid dimensions ${width}x${height}")
             return false
         }
+        // Remember valid landscape dims for fallback on transient portrait reports.
+        if (width > height) {
+            lastLandscapeW = width
+            lastLandscapeH = height
+        }
+        return createDisplay(width, height, density)
+    }
 
+    /**
+     * Creates the [VirtualDisplay] on a private ImageReader-backed
+     * [Surface] — decoupled from the car surface — and launches the target
+     * activity onto it via `am start` as root. The capture loop hands the
+     * frames over to the car surface.
+     */
+    private fun createDisplay(width: Int, height: Int, density: Int): Boolean {
         destroy() // ensure any previous display + callbacks are released first
 
         surfaceWidth = width
         surfaceHeight = height
         surfaceDensity = density
 
-        // Remember valid landscape dims for fallback on transient portrait reports.
-        if (width > height) {
-            lastLandscapeW = width
-            lastLandscapeH = height
-        }
+        // Decoupled render target: the display renders onto an ImageReader-
+        // backed surface (never the car surface). The reader discards every
+        // arriving frame, keeping the display's buffer queue drained so the
+        // compositor never stalls; the real consumption is PixelCopy of the
+        // projected window.
+        val reader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2)
+        reader.setOnImageAvailableListener(
+            { r ->
+                try {
+                    r.acquireLatestImage()?.close()
+                } catch (e: Exception) {
+                    AALogger.w("CarDisplay: image discard failed: ${e.message}")
+                }
+            },
+            null
+        )
+        val ownSurface = reader.surface
 
         val displayManager = context.getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
 
@@ -227,17 +354,23 @@ class CarDisplay(
                 width,
                 height,
                 density,
-                surface,
+                ownSurface,
                 VIRTUAL_DISPLAY_FLAGS
             )
         } catch (e: Exception) {
             AALogger.e("createVirtualDisplay failed: ${e.message}", e)
+            reader.close()
             return false
         }
 
-        val vd = virtualDisplay ?: return false
+        val vd = virtualDisplay ?: run {
+            reader.close()
+            return false
+        }
+        imageReader = reader
+        virtualSurface = ownSurface
         displayId = vd.display.displayId
-        AALogger.i("VirtualDisplay created: id=$displayId, ${width}x${height}, density=$density")
+        AALogger.i("VirtualDisplay created: id=$displayId, ${width}x${height}, density=$density (decoupled surface)")
         AALogger.shareableCopy()
 
         // Register lifecycle callbacks BEFORE launching the activity so we
@@ -251,6 +384,7 @@ class CarDisplay(
         if (attached != null && !attached.isFinishing && !attached.isDestroyed) {
             AALogger.i("CarDisplay: activity already attached on display $displayId — skipping am start")
             AALogger.shareableCopy()
+            ensureCaptureLoop()
             return true
         }
 
@@ -311,6 +445,7 @@ class CarDisplay(
                 @Suppress("DEPRECATION")
                 context.startActivity(intent, options.toBundle())
                 AALogger.i("CarDisplay: fallback startActivity succeeded")
+                ensureCaptureLoop()
             } catch (e: SecurityException) {
                 AALogger.e("CarDisplay: fallback startActivity blocked: ${e.message}", e)
                 AALogger.shareableCopy()
@@ -329,6 +464,7 @@ class CarDisplay(
             }
         }
 
+        ensureCaptureLoop()
         return true
     }
 
@@ -337,6 +473,27 @@ class CarDisplay(
      * the surface. Call from [SurfaceCallback.onSurfaceDestroyed].
      */
     fun destroy() {
+        // Stop the capture loop first so no further PixelCopy/draw touches
+        // the surfaces or bitmaps being torn down below.
+        val handler = captureHandler
+        val thread = captureThread
+        captureHandler = null
+        captureThread = null
+        handler?.removeCallbacksAndMessages(null)
+        thread?.quitSafely()
+        captureInFlight = false
+        captureBitmap?.recycle()
+        captureBitmap = null
+        captureBitmapW = 0
+        captureBitmapH = 0
+        lastFrame.getAndSet(null)?.recycle()
+        cropScale = 1f
+        cropSrcX = 0
+        cropSrcY = 0
+        inputMappingLogged = false
+        firstFrameDrawn = false
+        lastCopySuccess = true
+
         // Finish the projected activity BEFORE releasing the display so no
         // orphan windows are left on a dead display.
         val activity = projectedActivity
@@ -363,6 +520,20 @@ class CarDisplay(
             }
             virtualDisplay = null
         }
+
+        // Close the display's ImageReader sink (after the display itself,
+        // so the compositor is gone first). ImageReader.close() releases
+        // its internal Surface.
+        imageReader?.let {
+            try {
+                it.close()
+            } catch (e: Exception) {
+                AALogger.w("Error closing ImageReader: ${e.message}")
+            }
+        }
+        imageReader = null
+        virtualSurface = null
+
         displayId = -1
         gestureInProgress = false
         scrollAnchorLogged = false
@@ -524,6 +695,203 @@ class CarDisplay(
         lifecycleCallbacks = null
     }
 
+    // ---- Capture / draw pipeline ------------------------------------------
+
+    /**
+     * Starts the dedicated capture thread and schedules the first
+     * iteration. PixelCopy from a [android.view.Window] requires API 26 —
+     * below that the loop is disabled and the map stays off-screen.
+     */
+    private fun ensureCaptureLoop() {
+        if (captureHandler != null) return
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
+            AALogger.e(
+                "CarDisplay: capture loop needs API 26+ (PixelCopy from Window) — " +
+                    "rendering disabled on API ${Build.VERSION.SDK_INT}"
+            )
+            return
+        }
+        val thread = HandlerThread(CAPTURE_THREAD_NAME).apply { start() }
+        captureThread = thread
+        captureHandler = Handler(thread.looper)
+        AALogger.i(
+            "CarDisplay: capture loop started on $CAPTURE_THREAD_NAME " +
+                "(interval=${CAPTURE_INTERVAL_MS}ms)"
+        )
+        scheduleCapture()
+    }
+
+    @RequiresApi(Build.VERSION_CODES.O)
+    private fun scheduleCapture() {
+        captureHandler?.postDelayed(captureRunnable, CAPTURE_INTERVAL_MS)
+    }
+
+    /**
+     * One capture iteration. Runs on the capture thread; the PixelCopy
+     * completion listener is delivered to the same thread, so the bitmap
+     * swap and the surface draw never race each other, and the main
+     * thread is never blocked.
+     */
+    @RequiresApi(Build.VERSION_CODES.O)
+    private val captureRunnable = object : Runnable {
+        override fun run() {
+            try {
+                captureAndDraw()
+            } catch (t: Throwable) {
+                AALogger.w("CarDisplay: capture iteration failed: ${t.message}")
+            }
+            scheduleCapture()
+        }
+    }
+
+    /**
+     * Requests a PixelCopy of the projected activity's window into a
+     * bitmap sized to the window. Skips this tick while a copy is still
+     * in flight (the interval is 500ms, copies are usually faster).
+     */
+    @RequiresApi(Build.VERSION_CODES.O)
+    private fun captureAndDraw() {
+        if (captureInFlight) return
+        val handler = captureHandler ?: return
+        val activity = projectedActivity ?: return
+        if (displayId == -1 || virtualDisplay == null) return
+        val decor = activity.window?.decorView ?: return
+        val w = decor.width
+        val h = decor.height
+        if (w <= 0 || h <= 0) return
+
+        val existing = captureBitmap
+        if (existing == null || existing.width != w || existing.height != h) {
+            existing?.recycle()
+            val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+            captureBitmap = bmp
+            if (captureBitmapW != w || captureBitmapH != h) {
+                captureBitmapW = w
+                captureBitmapH = h
+                AALogger.i("CarDisplay: capture bitmap resized to ${w}x${h} (projected window)")
+            }
+        }
+
+        try {
+            captureInFlight = true
+            PixelCopy.request(
+                activity.window, null, captureBitmap!!, pixelCopyListener, handler
+            )
+        } catch (e: Exception) {
+            captureInFlight = false
+            logCopyFailure("request threw: ${e.message}")
+        }
+    }
+
+    /**
+     * Handles the PixelCopy result (on the capture thread): on SUCCESS the
+     * frame becomes the new lastFrame and is drawn onto the car surface;
+     * on failure the last valid frame stays on screen.
+     */
+    @RequiresApi(Build.VERSION_CODES.O)
+    private val pixelCopyListener = PixelCopy.OnPixelCopyFinishedListener { result ->
+        captureInFlight = false
+        val bmp = captureBitmap
+        captureBitmap = null
+        if (result == PixelCopy.SUCCESS) {
+            if (!lastCopySuccess) {
+                lastCopySuccess = true
+                AALogger.i("CarDisplay: PixelCopy succeeded (result=SUCCESS) — capture resumed")
+            }
+            if (bmp != null) {
+                val old = lastFrame.getAndSet(bmp)
+                drawFrame(bmp, bmp.width, bmp.height)
+                old?.recycle()
+            }
+        } else {
+            if (lastCopySuccess) {
+                lastCopySuccess = false
+                AALogger.w("CarDisplay: PixelCopy failed (result=$result) — keeping last frame")
+                AALogger.shareableCopy()
+            }
+            logCopyFailure("result=$result")
+            bmp?.recycle()
+        }
+    }
+
+    /** Rate-limited warning for capture failures — at most once per 30s. */
+    private fun logCopyFailure(detail: String) {
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastCopyFailLogAt < COPY_FAIL_LOG_INTERVAL_MS) return
+        lastCopyFailLogAt = now
+        AALogger.w("CarDisplay: capture failed ($detail) — keeping last frame (rate-limited)")
+    }
+
+    /**
+     * Draws [bitmap] onto the car surface with a crop-to-fill (cover)
+     * transform: scale = max(carW/bw, carH/bh), centered, so the whole
+     * landscape car surface is covered even when the window content is
+     * portrait-letterboxed.
+     *
+     * Publishes the crop rect (scale + src origin) for the inverse input
+     * mapping. Runs on the capture thread — lockCanvas/unlockCanvasAndPost
+     * happen on the same thread that captures.
+     */
+    private fun drawFrame(bitmap: Bitmap, bw: Int, bh: Int) {
+        val surface = carSurface ?: return
+        val cw = carWidth
+        val ch = carHeight
+        if (cw <= 0 || ch <= 0) return
+        if (!surface.isValid) {
+            AALogger.w("CarDisplay: car surface is invalid — cannot draw frame")
+            return
+        }
+
+        val scale = max(cw / bw.toFloat(), ch / bh.toFloat())
+        val srcW = minOf((cw / scale).toInt(), bw)
+        val srcH = minOf((ch / scale).toInt(), bh)
+        val srcX = (bw - srcW) / 2
+        val srcY = (bh - srcH) / 2
+        val src = Rect(srcX, srcY, srcX + srcW, srcY + srcH)
+        val dst = RectF(0f, 0f, cw.toFloat(), ch.toFloat())
+
+        // Publish the crop mapping for input (read on the main thread).
+        cropScale = scale
+        cropSrcX = srcX
+        cropSrcY = srcY
+
+        // Log the draw transform only when it changes — not every 500ms.
+        if (scale != lastDrawScale || srcX != lastDrawSrcX || srcY != lastDrawSrcY ||
+            cw != lastDrawDstW || ch != lastDrawDstH
+        ) {
+            lastDrawScale = scale
+            lastDrawSrcX = srcX
+            lastDrawSrcY = srcY
+            lastDrawDstW = cw
+            lastDrawDstH = ch
+            AALogger.i(
+                "CarDisplay: draw transform bitmap=${bw}x${bh} -> dst=${cw}x${ch} " +
+                    "scale=$scale src=[$srcX,$srcY,${srcX + srcW},${srcY + srcH}]"
+            )
+        }
+
+        try {
+            val canvas = surface.lockHardwareCanvas() ?: run {
+                AALogger.w("CarDisplay: lockHardwareCanvas returned null — frame skipped")
+                return
+            }
+            try {
+                canvas.drawBitmap(bitmap, src, dst, drawPaint)
+            } finally {
+                surface.unlockCanvasAndPost(canvas)
+            }
+        } catch (e: Exception) {
+            AALogger.e("CarDisplay: draw failed: ${e.message}", e)
+            return
+        }
+
+        if (!firstFrameDrawn) {
+            firstFrameDrawn = true
+            AALogger.i("CarDisplay: first frame drawn (${cw}x${ch})")
+            AALogger.shareableCopy()
+        }
+    }
+
     // ---- MotionEvent dispatch helpers ------------------------------------
 
     /**
@@ -532,20 +900,23 @@ class CarDisplay(
      *
      * ## Coordinate transform
      *
-     * The host sends touch coordinates in **display space**, but
-     * `View.dispatchTouchEvent` expects **window-local** coordinates. The
-     * window can be offset on the display (e.g. letterboxing) and/or
-     * rotated (`Display.getRotation()` != 0), so before dispatch every
-     * pointer is mapped with an affine transform (via [Matrix]):
+     * The host sends touch coordinates in **car-surface space**, but
+     * `View.dispatchTouchEvent` expects **window-local** coordinates, and
+     * the captured frame is scaled/cropped onto the car surface. Before
+     * dispatch every pointer is mapped in two steps (via [Matrix]):
      *
-     * 1. Subtract the window's on-screen location
-     *    ([android.view.View.getLocationOnScreen]) from the event
-     *    coordinates — this compensates the window offset.
-     * 2. If the display reports rotation, apply the inverse rotation using
-     *    the display's current real dimensions:
-     *    - `ROTATION_90`  (1): (x, y) → (y, w-1-x)
-     *    - `ROTATION_180` (2): (x, y) → (w-1-x, h-1-y)
-     *    - `ROTATION_270` (3): (x, y) → (h-1-y, x)
+     * 1. Inverse crop-to-fill: (x, y) → (x/scale + srcX, y/scale + srcY)
+     *    using the crop rect of the last drawn frame — car-surface
+     *    coordinates become projected-window coordinates.
+     * 2. Window compensation:
+     *    a. Subtract the window's on-screen location
+     *       ([android.view.View.getLocationOnScreen]) from the event
+     *       coordinates — this compensates the window offset.
+     *    b. If the display reports rotation, apply the inverse rotation
+     *       using the display's current real dimensions:
+     *       - `ROTATION_90`  (1): (x, y) → (y, w-1-x)
+     *       - `ROTATION_180` (2): (x, y) → (w-1-x, h-1-y)
+     *       - `ROTATION_270` (3): (x, y) → (h-1-y, x)
      *
      * The transform is applied to **every pointer** of the event, so
      * multi-pointer gestures (pinch) are covered uniformly.
@@ -573,7 +944,31 @@ class CarDisplay(
             return
         }
 
-        // Window offset in display space (letterboxing shifts the window).
+        // Step 1 — inverse crop mapping: host coords are car-surface
+        // coords; map them back into the projected window space using the
+        // crop transform of the last drawn frame (see drawFrame()).
+        val scale = cropScale
+        if (!inputMappingLogged &&
+            (event.actionMasked == MotionEvent.ACTION_DOWN ||
+                event.actionMasked == MotionEvent.ACTION_POINTER_DOWN)
+        ) {
+            inputMappingLogged = true
+            AALogger.i(
+                "CarDisplay: input crop mapping car=(${event.x},${event.y}) -> " +
+                    "window=(${event.x / scale + cropSrcX},${event.y / scale + cropSrcY}) " +
+                    "(scale=$scale, src=($cropSrcX,$cropSrcY))"
+            )
+            AALogger.shareableCopy()
+        }
+        if (scale > 0f && (scale != 1f || cropSrcX != 0 || cropSrcY != 0)) {
+            val cropInv = Matrix()
+            cropInv.setScale(1f / scale, 1f / scale)
+            cropInv.postTranslate(cropSrcX.toFloat(), cropSrcY.toFloat())
+            event.transform(cropInv)
+        }
+
+        // Step 2 — window offset in display space (letterboxing shifts the
+        // window) and display rotation compensation.
         val loc = IntArray(2)
         decor.getLocationOnScreen(loc)
         val rotation = display.rotation
@@ -792,8 +1187,8 @@ class CarDisplay(
      * The center is `getLocationOnScreen` + half the decor size, which is
      * already display space (window → display is the inverse of the
      * dispatch transform; the rectangle center is invariant under the
-     * window rotation), so the dispatch transform still applies exactly
-     * once — it is NOT applied here.
+     * window rotation), so the dispatch transform — including the inverse
+     * crop mapping — still applies exactly once: it is NOT applied here.
      */
     private fun ensureGestureDown() {
         if (gestureInProgress) return
