@@ -1,12 +1,16 @@
 # Petal Maps Hidden API Unlock (módulo LSPosed)
 
-Módulo LSPosed que isenta hidden APIs no processo do Petal Maps
-(`com.huawei.maps.app`). A extension injetada no APK usa reflexão em APIs
-`@hide` — `android.window.ScreenCapture`, `SurfaceControl.screenshot` — e a
-isenção de hidden APIs é por processo, então precisa ser aplicada dentro do
-processo do Petal Maps antes dessas chamadas.
+Módulo LSPosed com duas funções para o Petal Maps (`com.huawei.maps.app`):
 
-## Técnica de isenção
+1. **Isenta hidden APIs** no processo do Petal Maps — a extension injetada no APK
+   usa reflexão em APIs `@hide` (`android.window.ScreenCapture`,
+   `SurfaceControl.screenshot`).
+2. **Concede `android.permission.READ_FRAME_BUFFER` no system_server** — em
+   Android 14+, `IWindowManager.captureDisplay` exige essa permissão signature;
+   o check resolve no `PermissionManagerService` para o UID do chamador, e o
+   módulo o transforma em GRANTED.
+
+## Técnica 1 — isenção de hidden APIs
 
 - Em API 28–33, módulos chamavam `dalvik.system.VMRuntime.setHiddenApiExemptions`
   via meta-reflexão; isso morreu no Android 11 (`PreventMetaReflectionBlocklistAccess`).
@@ -16,7 +20,7 @@ processo do Petal Maps antes dessas chamadas.
   primeiro para callers de domínio application
   ([hidden_api.cc](https://android.googlesource.com/platform/art/+/refs/heads/android15-release/runtime/hidden_api.cc) —
   `DoesPrefixMatchAny(runtime->GetHiddenApiExemptions())`). O que é bloqueado é o
-  *lookup reflexivo* do próprio método (domínio do caller vem do dex do módulo).
+  *lookup reflexivo* do próprio método.
 - Este módulo faz o bootstrap da chamada com a biblioteca oficial do LSPosed
   [LSPosed/AndroidHiddenApiBypass](https://github.com/LSPosed/AndroidHiddenApiBypass)
   (`org.lsposed.hiddenapibypass:hiddenapibypass`, mantida 2021–2025, suporte declarado
@@ -24,8 +28,40 @@ processo do Petal Maps antes dessas chamadas.
   O prefixo `"L"` isenta todas as APIs hidden do processo; os prefixos específicos
   (`ScreenCapture`, `SurfaceControl`, etc.) são redundantes com `"L"`, mas ficam
   listados por clareza.
-- O módulo verifica o resultado e loga em logcat (tag `PetalMapsHiddenApi`):
-  `Verification: SurfaceControl.screenshot via reflection ACCESSIBLE`.
+
+## Técnica 2 — READ_FRAME_BUFFER no captureDisplay (API 34+)
+
+Cadeia verificada no AOSP (android14- e android15-release):
+
+```
+WindowManagerService.captureDisplay
+  -> checkCallingPermission(READ_FRAME_BUFFER)   // throw SecurityException se negado
+  -> ContextImpl.checkCallingPermission
+  -> ActivityManagerService.checkPermission
+  -> ActivityManager.checkComponentPermission (static)
+  -> IPackageManager.checkUidPermission
+  -> ComputerEngine.checkUidPermission           // services/core/.../pm/ComputerEngine.java
+  -> PermissionManagerService.checkUidPermission // ponto final da decisão
+```
+
+O hook é instalado no **system_server** (escopo System Framework) sobre a classe
+`com.android.server.pm.permission.PermissionManagerService`, nos dois overloads que
+existem conforme a versão:
+
+- Android 14: `checkUidPermission(int uid, String permName)` (privado)
+- Android 15: `checkUidPermission(int uid, String permissionName, int deviceId)` (público)
+
+Um after-hook substitui o resultado por `PERMISSION_GRANTED` quando
+`args[1].equals("android.permission.READ_FRAME_BUFFER")` — o método original
+executa normalmente (side effects de auditoria preservados); só a decisão muda.
+O overload inexistente na versão em uso falha em `findAndHookMethod` e é
+ignorado com log (`Permission hook not present on this version: ...`).
+
+**Trade-off documentado**: o grant vale para **qualquer UID** consultando
+`READ_FRAME_BUFFER` (não apenas o Petal Maps). Qualquer app que consiga chamar
+`captureDisplay` passa a ter o check liberado. Em device pessoal o risco é
+baixo; para restringir, filtre por uid no hook (resolva o uid via
+`getPackageUid` ou compartilhe-o do processo do app via `XSharedPreferences`).
 
 ## Requisitos
 
@@ -53,10 +89,12 @@ cd lsposed && ../gradlew -p . assembleRelease
 
 1. Instale o APK: `adb install lsposed/app/build/outputs/apk/release/app-release.apk`.
 2. Abra o LSPosed Manager → **Módulos** → ative **Petal Maps Hidden API Unlock**.
-3. No escopo do módulo, marque **com.huawei.maps.app** (o manifest já sugere o
-   escopo via meta-data `xposedscope`; confirme na UI).
-4. Force parada do Petal Maps (ou reinicie) — o módulo entra em vigor ao carregar
-   o processo, antes de `Application.onCreate`.
+3. No escopo do módulo, marque **com.huawei.maps.app** e **System Framework**
+   (o manifest sugere os dois via meta-data `xposedscope`; o item "System
+   Framework" corresponde ao package `android` — o LSPosed faz esse mapeamento
+   automaticamente para módulos legacy).
+4. Reinicie o device (o hook de system_server só entra em vigor no boot do
+   system_server) e force parada do Petal Maps.
 
 ## Verificação
 
@@ -64,7 +102,19 @@ cd lsposed && ../gradlew -p . assembleRelease
 adb logcat -s PetalMapsHiddenApi:I
 ```
 
-Procure por `setHiddenApiExemptions: OK` e
-`Verification: SurfaceControl.screenshot via reflection ACCESSIBLE`. A isenção
-vale por processo: se o Petal Maps tiver processos secundários, cada um aplica
-a própria isenção ao carregar.
+No processo do Petal Maps:
+`setHiddenApiExemptions: OK` e
+`Verification: SurfaceControl.screenshot via reflection ACCESSIBLE`.
+
+No system_server (durante o boot):
+`Permission hook installed: com.android.server.pm.permission.PermissionManagerService.checkUidPermission`
+(para o overload da sua versão de Android). Quando a captura roda:
+`grant READ_FRAME_BUFFER (uid=..., count=1)`.
+
+## Notas
+
+- A isenção de hidden APIs vale por processo: o Petal Maps e o system_server
+  aplicam a própria ao carregar; processos secundários do app também.
+- HyperOS (Xiaomi) pode ter modificado o caminho de `captureDisplay`; se o hook
+  não for suficiente, confira o log (`Permission hook installed/not present`)
+  e o logcat do WMS.

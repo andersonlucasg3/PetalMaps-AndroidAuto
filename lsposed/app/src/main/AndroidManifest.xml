@@ -17,7 +17,7 @@
             android:value="Isenta hidden APIs (ScreenCapture/SurfaceControl) no processo com.huawei.maps.app" />
         <meta-data
             android:name="xposedscope"
-            android:value="com.huawei.maps.app" />
+            android:value="com.huawei.maps.app;android" />
     </application>
 
 </manifest>
