@@ -27,6 +27,7 @@ import android.view.Surface
 import android.view.View
 import androidx.annotation.RequiresApi
 import androidx.car.app.SurfaceContainer
+import java.nio.ByteBuffer
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.max
 
@@ -39,8 +40,10 @@ import kotlin.math.max
  * The VirtualDisplay is decoupled from the car surface: it renders onto a
  * private [ImageReader]-backed [Surface] (frames discarded — the reader
  * only keeps the display's buffer queue drained), while a dedicated
- * capture thread samples the projected activity's window every ~500ms via
- * [PixelCopy] and draws the latest frame onto the car surface with a
+ * capture thread grabs the composited virtual display every ~500ms via
+ * root `screencap -d` (raw RGBA — includes SurfaceView/GL layers that
+ * window [PixelCopy] misses), falling back to window PixelCopy when
+ * screencap fails. The latest frame is drawn onto the car surface with a
  * crop-to-fill (cover) transform, so portrait-letterboxed window content
  * fills the whole landscape car surface. On capture failure the last
  * valid frame stays on screen (never black).
@@ -107,6 +110,9 @@ class CarDisplay(
 
         /** Name of the dedicated capture thread. */
         private const val CAPTURE_THREAD_NAME = "PetalAA-Capture"
+
+        /** Retry the screencap path every N iterations while it is failing. */
+        private const val SCREENCAP_RETRY_EVERY = 10
     }
 
     // ---- state -----------------------------------------------------------
@@ -158,9 +164,10 @@ class CarDisplay(
     /**
      * Private ImageReader (frame sink) + its Surface — the VirtualDisplay
      * renders onto this, never onto the car surface. Arriving frames are
-     * discarded immediately; consumption happens via PixelCopy of the
-     * projected window. The Surface belongs to the ImageReader — it must
-     * NOT be released manually, [ImageReader.close] does it.
+     * discarded immediately; consumption happens via root screencap of the
+     * display (or window PixelCopy as fallback). The Surface belongs to
+     * the ImageReader — it must NOT be released manually, [ImageReader.close]
+     * does it.
      */
     private var imageReader: ImageReader? = null
     private var virtualSurface: Surface? = null
@@ -182,6 +189,30 @@ class CarDisplay(
     private var lastCopySuccess: Boolean = true
     private var lastCopyFailLogAt: Long = 0L
     private var firstFrameDrawn: Boolean = false
+
+    // ---- Screencap (root) capture state -----------------------------------
+
+    /** Consecutive screencap failures; when > 0 the PixelCopy path is active. */
+    private var screencapConsecutiveFailures: Int = 0
+
+    /** Capture loop iteration counter — drives the periodic screencap retry. */
+    private var captureIteration: Long = 0L
+
+    /** Active capture path ("screencap" / "pixelcopy") — logged on change. */
+    private var activeCapturePath: String? = null
+    private var lastPathLogAt: Long = 0L
+
+    /** Screencap timing stats — logged on the 1st frame and every 30s. */
+    private var screencapCount: Long = 0L
+    private var screencapTotalMs: Long = 0L
+    private var lastScreencapStatLogAt: Long = 0L
+
+    /** Rate-limited screencap failure log. */
+    private var lastScreencapFailLogAt: Long = 0L
+
+    /** Last raw dims that differed from the display — logged once per change. */
+    private var lastRawW: Int = 0
+    private var lastRawH: Int = 0
 
     /**
      * Crop-to-fill mapping of the last drawn frame (capture thread writes,
@@ -493,6 +524,12 @@ class CarDisplay(
         inputMappingLogged = false
         firstFrameDrawn = false
         lastCopySuccess = true
+        screencapConsecutiveFailures = 0
+        activeCapturePath = null
+        screencapCount = 0L
+        screencapTotalMs = 0L
+        lastRawW = 0
+        lastRawH = 0
 
         // Finish the projected activity BEFORE releasing the display so no
         // orphan windows are left on a dead display.
@@ -699,8 +736,8 @@ class CarDisplay(
 
     /**
      * Starts the dedicated capture thread and schedules the first
-     * iteration. PixelCopy from a [android.view.Window] requires API 26 —
-     * below that the loop is disabled and the map stays off-screen.
+     * iteration. The fallback window PixelCopy requires API 26 — below
+     * that the loop is disabled and the map stays off-screen.
      */
     private fun ensureCaptureLoop() {
         if (captureHandler != null) return
@@ -735,6 +772,7 @@ class CarDisplay(
     @RequiresApi(Build.VERSION_CODES.O)
     private val captureRunnable = object : Runnable {
         override fun run() {
+            captureIteration++
             try {
                 captureAndDraw()
             } catch (t: Throwable) {
@@ -745,16 +783,36 @@ class CarDisplay(
     }
 
     /**
-     * Requests a PixelCopy of the projected activity's window into a
-     * bitmap sized to the window. Skips this tick while a copy is still
-     * in flight (the interval is 500ms, copies are usually faster).
+     * One capture iteration. Primary path: root `screencap -d` of the
+     * composited virtual display (captures SurfaceView/GL layers — the
+     * map — that window PixelCopy misses). Fallback: window PixelCopy.
+     * Runs on the capture thread; skips this tick while a PixelCopy is
+     * still in flight (the interval is 500ms, copies are usually faster).
      */
     @RequiresApi(Build.VERSION_CODES.O)
     private fun captureAndDraw() {
         if (captureInFlight) return
-        val handler = captureHandler ?: return
         val activity = projectedActivity ?: return
         if (displayId == -1 || virtualDisplay == null) return
+
+        // Path 1 — root screencap of the virtual display. While it fails,
+        // retry only every SCREENCAP_RETRY_EVERY ticks to avoid paying the
+        // su process spawn on every 500ms tick.
+        if (screencapConsecutiveFailures == 0 ||
+            captureIteration % SCREENCAP_RETRY_EVERY == 0L
+        ) {
+            val frame = captureViaScreencap()
+            if (frame != null) {
+                screencapConsecutiveFailures = 0
+                logActivePath("screencap")
+                publishFrame(frame)
+                return
+            }
+            screencapConsecutiveFailures++
+        }
+
+        // Path 2 (fallback) — window PixelCopy.
+        val handler = captureHandler ?: return
         val decor = activity.window?.decorView ?: return
         val w = decor.width
         val h = decor.height
@@ -784,6 +842,92 @@ class CarDisplay(
     }
 
     /**
+     * Captures the composited virtual display via root `screencap -d`
+     * (raw RGBA). Returns the parsed frame bitmap, or null on any failure
+     * — callers fall back to the PixelCopy path.
+     */
+    private fun captureViaScreencap(): Bitmap? {
+        val id = displayId
+        if (id == -1) return null
+        val started = SystemClock.elapsedRealtime()
+        val bytes = RootShell.runBytes("screencap -d $id")
+            ?: return logScreencapFailure("runBytes failed")
+        val elapsed = SystemClock.elapsedRealtime() - started
+        val frame = parseScreencapRaw(bytes, surfaceWidth, surfaceHeight)
+            ?: return logScreencapFailure("unparseable raw header (${bytes.size} bytes)")
+
+        // Timing stats — log the 1st frame, then averages every 30s.
+        screencapCount++
+        screencapTotalMs += elapsed
+        val now = SystemClock.elapsedRealtime()
+        if (screencapCount == 1L) {
+            AALogger.i(
+                "CarDisplay: screencap raw ok: ${frame.w}x${frame.h} fmt=${frame.format} " +
+                    "in ${elapsed}ms (${bytes.size} bytes)"
+            )
+            AALogger.shareableCopy()
+        } else if (now - lastScreencapStatLogAt >= COPY_FAIL_LOG_INTERVAL_MS) {
+            lastScreencapStatLogAt = now
+            AALogger.i(
+                "CarDisplay: screencap avg=${screencapTotalMs / screencapCount}ms over " +
+                    "$screencapCount frames (last=${elapsed}ms)"
+            )
+            screencapCount = 0L
+            screencapTotalMs = 0L
+        }
+
+        // Raw dims vs expected display dims — log once per change.
+        if (frame.w != surfaceWidth || frame.h != surfaceHeight) {
+            if (frame.w != lastRawW || frame.h != lastRawH) {
+                lastRawW = frame.w
+                lastRawH = frame.h
+                AALogger.w(
+                    "CarDisplay: screencap raw dims ${frame.w}x${frame.h} differ from " +
+                        "display ${surfaceWidth}x${surfaceHeight}"
+                )
+            }
+        }
+
+        return frame.toBitmap()
+    }
+
+    /** Rate-limited screencap failure warning — at most once per 30s. */
+    private fun logScreencapFailure(detail: String): Bitmap? {
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastScreencapFailLogAt >= COPY_FAIL_LOG_INTERVAL_MS) {
+            lastScreencapFailLogAt = now
+            AALogger.w("CarDisplay: screencap failed ($detail) — falling back to PixelCopy (rate-limited)")
+        }
+        return null
+    }
+
+    /**
+     * Tracks the active capture path and logs transitions (rate-limited to
+     * once per 30s so path flapping cannot spam the log).
+     */
+    private fun logActivePath(path: String) {
+        if (activeCapturePath == path) return
+        val now = SystemClock.elapsedRealtime()
+        val logIt = now - lastPathLogAt >= COPY_FAIL_LOG_INTERVAL_MS
+        activeCapturePath = path
+        if (logIt) {
+            lastPathLogAt = now
+            AALogger.i("CarDisplay: active capture path -> $path")
+            AALogger.shareableCopy()
+        }
+    }
+
+    /**
+     * Publishes a captured frame: stores it as the last valid frame,
+     * draws it onto the car surface, and recycles the previous one.
+     */
+    private fun publishFrame(bitmap: Bitmap) {
+        val old = lastFrame.getAndSet(bitmap)
+        drawFrame(bitmap, bitmap.width, bitmap.height)
+        old?.recycle()
+    }
+
+    /**
      * Handles the PixelCopy result (on the capture thread): on SUCCESS the
      * frame becomes the new lastFrame and is drawn onto the car surface;
      * on failure the last valid frame stays on screen.
@@ -799,9 +943,8 @@ class CarDisplay(
                 AALogger.i("CarDisplay: PixelCopy succeeded (result=SUCCESS) — capture resumed")
             }
             if (bmp != null) {
-                val old = lastFrame.getAndSet(bmp)
-                drawFrame(bmp, bmp.width, bmp.height)
-                old?.recycle()
+                logActivePath("pixelcopy")
+                publishFrame(bmp)
             }
         } else {
             if (lastCopySuccess) {
@@ -1234,5 +1377,85 @@ class CarDisplay(
         dispatchToActivity(up)
         up.recycle()
         gestureInProgress = false
+    }
+}
+
+// ---- Raw screencap frame parsing -------------------------------------------
+
+/**
+ * One parsed raw `screencap` frame (header stripped, pixels only).
+ */
+private class RawFrame(
+    val w: Int,
+    val h: Int,
+    val format: Int,
+    val pixels: ByteArray
+) {
+
+    /**
+     * Converts to an ARGB_8888 bitmap. RGBA_8888 (1) and RGBX_8888 (2)
+     * pass through directly; BGRA_8888 (5) gets its R/B channels swapped.
+     */
+    fun toBitmap(): Bitmap {
+        if (format == 5) {
+            // BGRA_8888 → RGBA: swap the R and B bytes of every pixel.
+            for (i in 0 until pixels.size step 4) {
+                val tmp = pixels[i]
+                pixels[i] = pixels[i + 2]
+                pixels[i + 2] = tmp
+            }
+        }
+        val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        bmp.copyPixelsFromBuffer(ByteBuffer.wrap(pixels))
+        return bmp
+    }
+}
+
+/**
+ * Parses a raw `screencap` frame. Header: 12 bytes (width, height,
+ * format) or 16 bytes (plus dataspace, Android 12+); screencap writes
+ * host byte order (little-endian on ARM64), but big-endian is accepted
+ * defensively — candidates are validated by pixel-payload size, so only
+ * the correct endianness survives. Supported formats: RGBA_8888 (1),
+ * RGBX_8888 (2), BGRA_8888 (5). Candidates whose dims match the display
+ * dims win; otherwise the first size-consistent candidate is used.
+ */
+private fun parseScreencapRaw(
+    data: ByteArray,
+    expectedW: Int,
+    expectedH: Int
+): RawFrame? {
+    var fallback: RawFrame? = null
+    for (headerLen in intArrayOf(16, 12)) {
+        if (data.size <= headerLen) continue
+        for (bigEndian in booleanArrayOf(false, true)) {
+            val w = readInt(data, 0, bigEndian)
+            val h = readInt(data, 4, bigEndian)
+            val format = readInt(data, 8, bigEndian)
+            if (w <= 0 || h <= 0 || w > 16_384 || h > 16_384) continue
+            val bpp = when (format) {
+                1, 2, 5 -> 4 // RGBA_8888 / RGBX_8888 / BGRA_8888
+                else -> 0 // RGB_565 etc. unsupported
+            }
+            if (bpp == 0) continue
+            if ((data.size - headerLen).toLong() != w.toLong() * h * bpp) continue
+            val frame = RawFrame(w, h, format, data.copyOfRange(headerLen, data.size))
+            if (w == expectedW && h == expectedH) return frame
+            if (fallback == null) fallback = frame
+        }
+    }
+    return fallback
+}
+
+/** Reads a 32-bit int from [data] at [offset] in the given byte order. */
+private fun readInt(data: ByteArray, offset: Int, bigEndian: Boolean): Int {
+    val b0 = data[offset].toInt() and 0xFF
+    val b1 = data[offset + 1].toInt() and 0xFF
+    val b2 = data[offset + 2].toInt() and 0xFF
+    val b3 = data[offset + 3].toInt() and 0xFF
+    return if (bigEndian) {
+        (b0 shl 24) or (b1 shl 16) or (b2 shl 8) or b3
+    } else {
+        (b3 shl 24) or (b2 shl 16) or (b1 shl 8) or b0
     }
 }
