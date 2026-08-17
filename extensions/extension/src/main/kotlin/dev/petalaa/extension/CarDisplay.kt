@@ -1,16 +1,19 @@
 package dev.petalaa.extension
 
+import android.annotation.SuppressLint
 import android.app.Activity
 import android.app.ActivityManager
 import android.app.Application
 import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
+import android.graphics.ColorSpace
 import android.graphics.Matrix
 import android.graphics.Paint
 import android.graphics.PixelFormat
 import android.graphics.Rect
 import android.graphics.RectF
+import android.hardware.HardwareBuffer
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
 import android.media.ImageReader
@@ -28,6 +31,7 @@ import android.view.View
 import androidx.annotation.RequiresApi
 import androidx.car.app.SurfaceContainer
 import java.nio.ByteBuffer
+import java.lang.reflect.Method
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.max
 
@@ -40,10 +44,13 @@ import kotlin.math.max
  * The VirtualDisplay is decoupled from the car surface: it renders onto a
  * private [ImageReader]-backed [Surface] (frames discarded — the reader
  * only keeps the display's buffer queue drained), while a dedicated
- * capture thread grabs the composited virtual display every ~500ms via
- * root `screencap -d` (raw RGBA — includes SurfaceView/GL layers that
- * window [PixelCopy] misses), falling back to window PixelCopy when
- * screencap fails. The latest frame is drawn onto the car surface with a
+ * capture thread grabs the composited virtual display every ~500ms.
+ * Primary path: in-process capture via hidden framework APIs unlocked at
+ * runtime by the companion LSPosed module (`ScreenCapture` via
+ * `IWindowManager.captureDisplay` on API 34+, `SurfaceControl.screenshot`
+ * below — raw RGBA, includes SurfaceView/GL layers that window
+ * [PixelCopy] misses). Fallbacks, in order: root `screencap -d`, then
+ * window PixelCopy. The latest frame is drawn onto the car surface with a
  * crop-to-fill (cover) transform, so portrait-letterboxed window content
  * fills the whole landscape car surface. On capture failure the last
  * valid frame stays on screen (never black).
@@ -164,10 +171,10 @@ class CarDisplay(
     /**
      * Private ImageReader (frame sink) + its Surface — the VirtualDisplay
      * renders onto this, never onto the car surface. Arriving frames are
-     * discarded immediately; consumption happens via root screencap of the
-     * display (or window PixelCopy as fallback). The Surface belongs to
-     * the ImageReader — it must NOT be released manually, [ImageReader.close]
-     * does it.
+     * discarded immediately; consumption happens via the in-process
+     * capture paths (reflection first, then root screencap, then window
+     * PixelCopy). The Surface belongs to the ImageReader — it must NOT be
+     * released manually, [ImageReader.close] does it.
      */
     private var imageReader: ImageReader? = null
     private var virtualSurface: Surface? = null
@@ -213,6 +220,26 @@ class CarDisplay(
     /** Last raw dims that differed from the display — logged once per change. */
     private var lastRawW: Int = 0
     private var lastRawH: Int = 0
+
+    // ---- In-process (reflection) capture state -----------------------------
+
+    /**
+     * Resolved reflection bridge (method handles cached). Null until the
+     * first capture attempt; once resolved it stays valid for the process
+     * lifetime, even across display re-creations.
+     */
+    private var reflectionBridge: InProcessCapture? = null
+
+    /** Consecutive in-process capture failures; when > 0 it is retried periodically. */
+    private var reflectionConsecutiveFailures: Int = 0
+
+    /** In-process capture timing stats — logged on the 1st frame and every 30s. */
+    private var reflectionCount: Long = 0L
+    private var reflectionTotalMs: Long = 0L
+    private var lastReflectionStatLogAt: Long = 0L
+
+    /** Rate-limited in-process capture failure log. */
+    private var lastReflectionFailLogAt: Long = 0L
 
     /**
      * Crop-to-fill mapping of the last drawn frame (capture thread writes,
@@ -362,8 +389,8 @@ class CarDisplay(
         // Decoupled render target: the display renders onto an ImageReader-
         // backed surface (never the car surface). The reader discards every
         // arriving frame, keeping the display's buffer queue drained so the
-        // compositor never stalls; the real consumption is PixelCopy of the
-        // projected window.
+        // compositor never stalls; the real consumption is the capture
+        // pipeline (in-process reflection capture → screencap → PixelCopy).
         val reader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2)
         reader.setOnImageAvailableListener(
             { r ->
@@ -530,6 +557,10 @@ class CarDisplay(
         screencapTotalMs = 0L
         lastRawW = 0
         lastRawH = 0
+        reflectionConsecutiveFailures = 0
+        reflectionCount = 0L
+        reflectionTotalMs = 0L
+        lastReflectionFailLogAt = 0L
 
         // Finish the projected activity BEFORE releasing the display so no
         // orphan windows are left on a dead display.
@@ -783,17 +814,35 @@ class CarDisplay(
     }
 
     /**
-     * One capture iteration. Primary path: root `screencap -d` of the
-     * composited virtual display (captures SurfaceView/GL layers — the
-     * map — that window PixelCopy misses). Fallback: window PixelCopy.
-     * Runs on the capture thread; skips this tick while a PixelCopy is
-     * still in flight (the interval is 500ms, copies are usually faster).
+     * One capture iteration. Primary path: in-process capture of the
+     * composited virtual display via hidden framework APIs unlocked by the
+     * LSPosed module (`ScreenCapture` on API 34+, `SurfaceControl` below —
+     * captures SurfaceView/GL layers — the map — that window PixelCopy
+     * misses). Fallback 1: root `screencap -d`. Fallback 2: window
+     * PixelCopy. Runs on the capture thread; skips this tick while a
+     * PixelCopy is still in flight (the interval is 500ms, copies are
+     * usually faster).
      */
     @RequiresApi(Build.VERSION_CODES.O)
     private fun captureAndDraw() {
         if (captureInFlight) return
         val activity = projectedActivity ?: return
         if (displayId == -1 || virtualDisplay == null) return
+
+        // Path 0 — in-process reflection capture. While it fails, retry
+        // only every SCREENCAP_RETRY_EVERY ticks (cheap on its own, but the
+        // failure log and the wasted frame slot still cost).
+        if (reflectionConsecutiveFailures == 0 ||
+            captureIteration % SCREENCAP_RETRY_EVERY == 0L
+        ) {
+            val frame = captureViaReflection()
+            if (frame != null) {
+                reflectionConsecutiveFailures = 0
+                publishFrame(frame)
+                return
+            }
+            reflectionConsecutiveFailures++
+        }
 
         // Path 1 — root screencap of the virtual display. While it fails,
         // retry only every SCREENCAP_RETRY_EVERY ticks to avoid paying the
@@ -839,6 +888,61 @@ class CarDisplay(
             captureInFlight = false
             logCopyFailure("request threw: ${e.message}")
         }
+    }
+
+    /**
+     * Captures the composited virtual display in-process via the hidden
+     * framework capture APIs (ScreenCapture / SurfaceControl), resolved by
+     * reflection and unlocked at runtime by the LSPosed module. Returns the
+     * frame bitmap, or null on any failure — callers fall back to the
+     * screencap path.
+     */
+    private fun captureViaReflection(): Bitmap? {
+        val bridge = reflectionBridge
+            ?: InProcessCapture(Build.VERSION.SDK_INT).also { reflectionBridge = it }
+        val started = SystemClock.elapsedRealtime()
+        val frame = try {
+            bridge.capture(displayId)
+        } catch (e: Exception) {
+            return logReflectionFailure("${e.javaClass.simpleName}: ${e.message}")
+        } ?: return logReflectionFailure("capture returned null")
+        val elapsed = SystemClock.elapsedRealtime() - started
+
+        // Timing stats — log the 1st frame, then averages every 30s.
+        reflectionCount++
+        reflectionTotalMs += elapsed
+        val now = SystemClock.elapsedRealtime()
+        if (reflectionCount == 1L) {
+            AALogger.i(
+                "CarDisplay: in-process capture ok (${bridge.pathName}): " +
+                    "${frame.width}x${frame.height} in ${elapsed}ms"
+            )
+            AALogger.shareableCopy()
+        } else if (now - lastReflectionStatLogAt >= COPY_FAIL_LOG_INTERVAL_MS) {
+            lastReflectionStatLogAt = now
+            AALogger.i(
+                "CarDisplay: in-process capture avg=${reflectionTotalMs / reflectionCount}ms over " +
+                    "$reflectionCount frames (last=${elapsed}ms)"
+            )
+            reflectionCount = 0L
+            reflectionTotalMs = 0L
+        }
+
+        logActivePath(bridge.pathName)
+        return frame
+    }
+
+    /** Rate-limited in-process capture failure log — at most once per 30s. */
+    private fun logReflectionFailure(detail: String): Bitmap? {
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastReflectionFailLogAt >= COPY_FAIL_LOG_INTERVAL_MS) {
+            lastReflectionFailLogAt = now
+            AALogger.d(
+                "CarDisplay: in-process capture failed ($detail) — " +
+                    "falling back to screencap/pixelcopy (rate-limited)"
+            )
+        }
+        return null
     }
 
     /**
@@ -1457,5 +1561,190 @@ private fun readInt(data: ByteArray, offset: Int, bigEndian: Boolean): Int {
         (b0 shl 24) or (b1 shl 16) or (b2 shl 8) or b3
     } else {
         (b3 shl 24) or (b2 shl 16) or (b1 shl 8) or b0
+    }
+}
+
+// ---- In-process (reflection) capture ----------------------------------------
+
+/** One resolved in-process capture path (method handles already cached). */
+private interface DisplayCaptureImpl {
+    /** Captures display [displayId]; null on failure, exceptions propagate. */
+    fun capture(displayId: Int): Bitmap?
+}
+
+/**
+ * In-process capture of the virtual display via hidden framework APIs,
+ * unlocked at runtime by the companion LSPosed module. All access goes
+ * through reflection so the dex has no compile-time dependency on hidden
+ * classes. Method handles are resolved once at construction (any failure —
+ * missing class, hidden-API SecurityException still enforced, ... — is
+ * remembered and re-thrown as [IllegalStateException] on every capture
+ * attempt, so the caller logs it rate-limited and falls back).
+ *
+ * - API 34+: `IWindowManager.captureDisplay(int, CaptureArgs, listener)`
+ *   (the SystemUI path — WindowManagerService resolves the display by id,
+ *   virtual displays included, and captures via ScreenCapture.captureLayers).
+ * - API 29-33: `SurfaceControl.screenshotToBuffer(IBinder display, ...)`
+ *   when a display token is resolvable, else
+ *   `SurfaceControl.screenshot(Rect, int, int, int)` (internal display
+ *   only). Note: on stock AOSP, SurfaceFlinger maps only *physical*
+ *   display ids to tokens (`getPhysicalDisplayToken`), so for a virtual
+ *   display the token path yields null and the internal display is used.
+ * - Below API 29: unsupported (null impl).
+ */
+private class InProcessCapture(sdkInt: Int) {
+
+    /** Active path name reported via `CarDisplay.logActivePath`. */
+    val pathName: String = if (sdkInt >= 34) "screenCapture" else "surfaceControl"
+
+    private val impl: DisplayCaptureImpl?
+    private val initError: String?
+
+    init {
+        var error: String? = null
+        impl = try {
+            when {
+                sdkInt >= 34 -> ScreenCaptureApi34.resolve()
+                sdkInt >= 29 -> SurfaceControlLegacy.resolve()
+                else -> {
+                    error = "API level $sdkInt < 29 — unsupported"
+                    null
+                }
+            }
+        } catch (t: Throwable) {
+            error = "${t.javaClass.simpleName}: ${t.message}"
+            null
+        }
+        initError = error
+    }
+
+    fun capture(displayId: Int): Bitmap? {
+        val i = impl ?: throw IllegalStateException(initError ?: "unavailable")
+        return i.capture(displayId)
+    }
+}
+
+/**
+ * API 34+: `IWindowManager.captureDisplay` + `ScreenCapture` (the
+ * SystemUI path). `captureArgs` is passed as null — WindowManagerService
+ * builds the default LayerCaptureArgs (RGBA_8888, display bounds) and
+ * captures the display by id, virtual displays included. The synchronous
+ * listener blocks up to ~1s (framework-internal latch) and yields the
+ * ScreenshotHardwareBuffer; `asBitmap()` wraps it into a hardware bitmap.
+ */
+private class ScreenCaptureApi34(
+    private val wm: Any,
+    private val captureDisplay: Method,
+    private val createSyncListener: Method,
+    private val getBuffer: Method,
+    private val asBitmap: Method,
+) : DisplayCaptureImpl {
+
+    override fun capture(displayId: Int): Bitmap? {
+        val listener = createSyncListener.invoke(null)
+        captureDisplay.invoke(wm, displayId, null, listener)
+        val buffer = getBuffer.invoke(listener) ?: return null
+        return asBitmap.invoke(buffer) as? Bitmap
+    }
+
+    companion object {
+        // Hidden-API access is intentional — unlocked at runtime by LSPosed.
+        @SuppressLint("BlockedPrivateApi", "DiscouragedPrivateApi", "PrivateApi")
+        fun resolve(): ScreenCaptureApi34 {
+            val wmGlobal = Class.forName("android.view.WindowManagerGlobal")
+            val wm = wmGlobal.getDeclaredMethod("getWindowManagerService").invoke(null)
+            val iwmClass = Class.forName("android.view.IWindowManager")
+            val scClass = Class.forName("android.window.ScreenCapture")
+            val captureArgsClass =
+                Class.forName("android.window.ScreenCapture\$CaptureArgs")
+            val listenerClass =
+                Class.forName("android.window.ScreenCapture\$ScreenCaptureListener")
+            val syncListenerClass =
+                Class.forName("android.window.ScreenCapture\$SynchronousScreenCaptureListener")
+            val bufferClass =
+                Class.forName("android.window.ScreenCapture\$ScreenshotHardwareBuffer")
+            return ScreenCaptureApi34(
+                wm = wm,
+                captureDisplay = iwmClass.getDeclaredMethod(
+                    "captureDisplay",
+                    Int::class.javaPrimitiveType,
+                    captureArgsClass,
+                    listenerClass,
+                ),
+                createSyncListener = scClass.getDeclaredMethod("createSyncCaptureListener"),
+                getBuffer = syncListenerClass.getDeclaredMethod("getBuffer"),
+                asBitmap = bufferClass.getDeclaredMethod("asBitmap"),
+            )
+        }
+    }
+}
+
+/**
+ * API 29-33: `SurfaceControl` captures.
+ *
+ * Preferred: the virtual display via
+ * `SurfaceControl.screenshotToBuffer(IBinder display, Rect, int, int,
+ * boolean, int)` + `Bitmap.wrapHardwareBuffer()`. The token comes from
+ * `SurfaceControl.getPhysicalDisplayToken(long)`; on stock AOSP
+ * SurfaceFlinger only maps physical display ids to tokens, so for our
+ * virtual display it is null and we degrade to the internal display.
+ *
+ * Degraded: `SurfaceControl.screenshot(Rect, int, int, int)` — internal
+ * display only (known limitation).
+ */
+@SuppressLint("NewApi")
+private class SurfaceControlLegacy(
+    private val getPhysicalDisplayToken: Method,
+    private val screenshotToBuffer: Method,
+    private val getGraphicBuffer: Method,
+    private val getColorSpace: Method,
+    private val screenshotInternal: Method,
+) : DisplayCaptureImpl {
+
+    override fun capture(displayId: Int): Bitmap? {
+        val token = getPhysicalDisplayToken.invoke(null, displayId.toLong())
+        if (token != null) {
+            val buffer = screenshotToBuffer.invoke(
+                null, token, Rect(), 0, 0, false, Surface.ROTATION_0
+            ) ?: return null
+            val graphicBuffer = getGraphicBuffer.invoke(buffer) as? HardwareBuffer ?: return null
+            val colorSpace = getColorSpace.invoke(buffer) as? ColorSpace
+            return Bitmap.wrapHardwareBuffer(graphicBuffer, colorSpace)
+        }
+        // Virtual-display token unavailable on this ROM — capture the
+        // internal display only (the screencap path handles the VD).
+        return screenshotInternal.invoke(null, Rect(), 0, 0, Surface.ROTATION_0) as? Bitmap
+    }
+
+    companion object {
+        // Hidden-API access is intentional — unlocked at runtime by LSPosed.
+        @SuppressLint("BlockedPrivateApi", "DiscouragedPrivateApi", "PrivateApi")
+        fun resolve(): SurfaceControlLegacy {
+            val scClass = Class.forName("android.view.SurfaceControl")
+            val sgbClass = Class.forName("android.view.SurfaceControl\$ScreenshotGraphicBuffer")
+            return SurfaceControlLegacy(
+                getPhysicalDisplayToken = scClass.getDeclaredMethod(
+                    "getPhysicalDisplayToken", Long::class.javaPrimitiveType
+                ),
+                screenshotToBuffer = scClass.getDeclaredMethod(
+                    "screenshotToBuffer",
+                    Class.forName("android.os.IBinder"),
+                    Rect::class.java,
+                    Int::class.javaPrimitiveType,
+                    Int::class.javaPrimitiveType,
+                    Boolean::class.javaPrimitiveType,
+                    Int::class.javaPrimitiveType,
+                ),
+                getGraphicBuffer = sgbClass.getDeclaredMethod("getGraphicBuffer"),
+                getColorSpace = sgbClass.getDeclaredMethod("getColorSpace"),
+                screenshotInternal = scClass.getDeclaredMethod(
+                    "screenshot",
+                    Rect::class.java,
+                    Int::class.javaPrimitiveType,
+                    Int::class.javaPrimitiveType,
+                    Int::class.javaPrimitiveType,
+                ),
+            )
+        }
     }
 }
