@@ -35,9 +35,9 @@ MORPHE_CLI="$PROJECT_DIR/tools/morphe-cli/morphe-desktop-1.12.0-all.jar"
 PATCHES_VERSION="$(grep -E '^version' "$PROJECT_DIR/gradle.properties" | cut -d= -f2 | tr -d ' ')"
 PATCHES_MPP="$PROJECT_DIR/patches/build/libs/patches-${PATCHES_VERSION}.mpp"
 INPUT_APK="$PROJECT_DIR/tools/apk/petal-maps.apk"
-OUTPUT_UNSIGNED="$PROJECT_DIR/build/petal-maps-aa-unsigned.apk"
-OUTPUT_ALIGNED="$PROJECT_DIR/build/petal-maps-aa-aligned.apk"
-OUTPUT_PATCHED="$PROJECT_DIR/build/petal-maps-aa-patched.apk"
+OUTPUT_UNSIGNED="$PROJECT_DIR/build/petal-maps-nh-unsigned.apk"
+OUTPUT_ALIGNED="$PROJECT_DIR/build/petal-maps-nh-aligned.apk"
+OUTPUT_PATCHED="$PROJECT_DIR/build/petal-maps-nh-patched.apk"
 KEYSTORE="$PROJECT_DIR/keystore/petalaa.keystore"
 RESULT_JSON="$PROJECT_DIR/build/patch-result.json"
 
@@ -66,10 +66,11 @@ echo "=== Step 1/5: Build patches ==="
 
 echo ""
 echo "=== Step 2/5: Apply Morphe patches ==="
-# Patch list (all enabled by default; the three main patches are):
-#   "Android Auto"            → injects CarAppService + manifest + resources
-#   "Anti-Repack Bypass"      → neutralizes SecurityDetect.irpj
+# Patch list (all enabled by default; the main patches are):
 #   "Manufacturer Check Bypass" → bypasses Huawei device restriction
+#   "Anti-Repack Bypass"        → neutralizes SecurityDetect.irpj
+#   "Huawei Login Fix"          → fixes login on non-Huawei devices
+#   "Change Package Name"       → optional: changes package name
 "$JAVA_HOME/bin/java" -jar "$MORPHE_CLI" patch \
     --unsigned \
     --force \

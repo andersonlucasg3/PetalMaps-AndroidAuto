@@ -1,4 +1,4 @@
-rootProject.name = "PetalMaps-AndroidAuto"
+rootProject.name = "PetalMaps-NonHuawei"
 
 pluginManagement {
     repositories {

@@ -2,12 +2,12 @@ group = "dev.petalaa"
 
 patches {
     about {
-        name = "PetalMaps Android Auto"
-        description = "Patches to inject Android Auto support into Petal Maps (com.huawei.maps.app)"
-        source = "https://github.com/petalaa/PetalMaps-AndroidAuto"
+        name = "Petal Maps Non-Huawei"
+        description = "Patches to run Petal Maps on non-Huawei devices"
+        source = "https://github.com/petalaa/PetalMaps-NonHuawei"
         author = "petalaa"
         contact = "petalaa@example.com"
-        website = "https://github.com/petalaa/PetalMaps-AndroidAuto"
+        website = "https://github.com/petalaa/PetalMaps-NonHuawei"
         license = "GNU General Public License v3.0"
     }
 }
